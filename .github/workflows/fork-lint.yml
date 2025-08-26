@@ -1,16 +1,11 @@
 name: Fork Comprehensive Lint
 
 on:
-  pull_request:
-    branches:
-      - main
-      - master
   push:
-    branches:
-      - main
-      - master
-      - 'feature/**'
-      - 'fix/**'
+    branches-ignore:
+      - 'main'
+      - 'master'
+
   workflow_dispatch:
 
 permissions: read-all
