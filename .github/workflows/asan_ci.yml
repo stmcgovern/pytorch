@@ -1,16 +1,9 @@
 # .github/workflows/asan_ci.yml
 #
-<<<<<<< HEAD
 # This workflow uses a Dockerfile to create a consistent environment
 # for the ASAN build and test process.
 
 name: Fork ASAN Build and Test (Docker)
-=======
-# This GitHub Actions workflow automates the ASAN build and test process.
-# It triggers on any push to a branch that isn't main or master.
-
-name: Fork ASAN Build and Test
->>>>>>> b7f0f1f771 (add a github action)
 
 on:
   push:
