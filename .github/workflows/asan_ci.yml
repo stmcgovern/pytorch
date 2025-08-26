@@ -22,11 +22,11 @@ jobs:
           # Submodules are disabled here because we will initialize them manually.
           submodules: false
 
-      - name: Initialize minimal CPU submodules
-        # This step now runs on the host runner.
-        run: |
-          chmod +x .github/scripts/init_cpu_submodules.sh
-          ./.github/scripts/init_cpu_submodules.sh
+      # - name: Initialize minimal CPU submodules
+      #   # This step now runs on the host runner.
+      #   run: |
+      #     chmod +x .github/scripts/init_cpu_submodules.sh
+      #     ./.github/scripts/init_cpu_submodules.sh
 
       - name: Set up Docker Buildx
         # This step sets up a builder instance that supports the GHA cache backend.
@@ -57,9 +57,8 @@ jobs:
             -w /workspace \
             pytorch-asan-build \
             bash -c " \
-              git config --global --add safe.directory /workspace && \
+              git config --global --add safe.directory '*' && \
               chmod +x .github/scripts/init_cpu_submodules.sh && \
               ./.github/scripts/init_cpu_submodules.sh && \
               chmod +x .github/scripts/run_asan_build.sh && \
               ./.github/scripts/run_asan_build.sh"
-
