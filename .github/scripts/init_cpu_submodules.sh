@@ -23,6 +23,7 @@ CPU_SUBMODULES=(
     "third_party/ittapi"
     "third_party/fmt"
     "third_party/googletest"
+    "third_party/benchmark"
 )
 
 # Use git submodule update --init on each required path.
