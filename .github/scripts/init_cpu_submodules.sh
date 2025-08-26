@@ -25,6 +25,7 @@ CPU_SUBMODULES=(
     "third_party/fmt"
     "third_party/googletest"
     "third_party/benchmark"
+    "third_party/pthreadpool"
 )
 
 # Use git submodule update --init on each required path.
