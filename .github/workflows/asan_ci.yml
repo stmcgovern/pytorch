@@ -19,8 +19,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # Submodules are disabled here because we will initialize them manually.
-          submodules: false
+          submodules: 'recursive'
 
       # - name: Initialize minimal CPU submodules
       #   # This step now runs on the host runner.
