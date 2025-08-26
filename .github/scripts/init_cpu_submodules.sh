@@ -17,7 +17,7 @@ CPU_SUBMODULES=(
     "third_party/fbgemm"
     "third_party/gloo"
     "third_party/cpuinfo"
-    "third_party/xnnpack"
+    "third_party/XNNPACK"
     "third_party/sleef"
     "third_party/ideep"
     "third_party/ittapi"
