@@ -1,0 +1,40 @@
+# .github/workflows/asan_ci.yml
+#
+# This workflow uses a Dockerfile to create a consistent environment
+# for the ASAN build and test process.
+
+name: Fork ASAN Build and Test (Docker)
+
+on:
+  push:
+    branches-ignore:
+      - 'main'
+      - 'master'
+
+jobs:
+  asan-build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Recursive checkout is needed to fetch essential submodules for a CPU build.
+          submodules: 'recursive'
+
+      - name: Build Docker image
+        # This step builds the Docker image using the Dockerfile.
+        # The image contains all necessary system dependencies (like clang).
+        run: |
+          docker build -t pytorch-asan-build -f .github/docker/Dockerfile.asan .
+
+      - name: Run ASAN Build and Test Script inside Docker
+        # This step runs the build script inside the container we just built.
+        # We mount the repository code into the container's workspace.
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            pytorch-asan-build \
+            bash -c "chmod +x .github/scripts/run_asan_build.sh && ./.github/scripts/run_asan_build.sh"
+
