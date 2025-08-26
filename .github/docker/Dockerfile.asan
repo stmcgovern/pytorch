@@ -32,7 +32,7 @@ WORKDIR /workspace
 
 # Copy and install Python dependencies first to leverage Docker layer caching.
 # This layer will only be rebuilt if requirements.txt changes.
-COPY requirements.txt .
+COPY requirements.txt requirements-build.txt .
 RUN pip install -r requirements.txt
 RUN pip install mkl-static mkl-include
 # Copy the rest of the repository content into the container
