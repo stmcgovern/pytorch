@@ -105,8 +105,12 @@ jobs:
             -w /workspace \
             -e CHANGED_FILES="$CHANGED_FILES" \
             -e CLANG="$CLANG" \
+            --user root \
             pytorch-lint:latest \
             bash -c "
+          # Configure git for container
+          git config --global --add safe.directory /workspace
+          
           # Mirror the exact logic from PyTorch's lintrunner.sh
           if [ "$CHANGED_FILES" = "*" ]; then
             export ADDITIONAL_LINTRUNNER_ARGS="--take CLANGTIDY,CLANGFORMAT --all-files"
@@ -196,8 +200,12 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
             -e CHANGED_FILES="$CHANGED_FILES" \
+            --user root \
             pytorch-lint:latest \
             bash -c "
+          # Configure git for container
+          git config --global --add safe.directory /workspace
+          
           echo \"Running mypy\"
           
           # Use uv to speed up lintrunner init
@@ -267,8 +275,12 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
             -e CHANGED_FILES="$CHANGED_FILES" \
+            --user root \
             pytorch-lint:latest \
             bash -c "
+          # Configure git for container
+          git config --global --add safe.directory /workspace
+          
           echo \"Running all other linters\"
           
           # Use uv to speed up lintrunner init
@@ -343,8 +355,12 @@ jobs:
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
+            --user root \
             pytorch-lint:latest \
             bash -c '
+          # Configure git for container
+          git config --global --add safe.directory /workspace
+          
           # Ensure no non-breaking spaces
           (! git --no-pager grep -In "$(printf '\''\xC2\xA0'\'')" -- . || (echo "The above lines have non-breaking spaces (U+00A0); please convert them to spaces (U+0020)"; false))
 
