@@ -19,9 +19,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # Recursive checkout is needed to fetch essential submodules for a CPU build.
-          submodules: 'recursive'
+          # Submodules are disabled here because we will initialize them manually.
+          submodules: false
 
+      - name: Initialize minimal CPU submodules
+        # This step runs a script to selectively clone only the submodules
+        # essential for a CPU build, skipping all GPU-related ones.
+        run: |
+          chmod +x .github/scripts/init_cpu_submodules.sh
+          ./.github/scripts/init_cpu_submodules.sh
       - name: Build Docker image
         # This step builds the Docker image using the Dockerfile.
         # The image contains all necessary system dependencies (like clang).

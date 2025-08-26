@@ -14,11 +14,13 @@ export CXX=clang++
 export USE_ASAN=1
 # Explicitly disable CUDA
 export USE_CUDA=0
+export USE_MPI=0
+export USE_DISTRIBUTED=0
 # Use all available CPU cores to speed up the build
 export MAX_JOBS=$(nproc)
 
 echo "--- Building PyTorch with ASAN enabled (CUDA disabled) ---"
-python setup.py build
+python setup.py install
 
 echo "--- Running targeted tests ---"
 # Run a small, high-value set of tests.
