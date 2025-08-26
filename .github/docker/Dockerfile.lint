@@ -1,0 +1,154 @@
+FROM ubuntu:22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set timezone to avoid tzdata prompts
+ENV TZ=UTC
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # Core utilities
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    software-properties-common \
+    gnupg \
+    lsb-release \
+    # Python development
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3-venv \
+    # C++ development and linting
+    build-essential \
+    cmake \
+    ninja-build \
+    clang-14 \
+    clang-format-14 \
+    clang-tidy-14 \
+    # Additional build tools
+    pkg-config \
+    autoconf \
+    automake \
+    libtool \
+    # Node.js for markdown-toc and other JS tools
+    nodejs \
+    npm \
+    # Documentation tools
+    doxygen \
+    # JSON processing
+    jq \
+    # Text processing utilities
+    grep \
+    sed \
+    awk \
+    # Archive tools
+    unzip \
+    tar \
+    gzip \
+    # Network tools
+    openssh-client \
+    # Clean up apt cache
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create symlinks for clang tools to standard names
+RUN ln -sf /usr/bin/clang-14 /usr/bin/clang && \
+    ln -sf /usr/bin/clang++-14 /usr/bin/clang++ && \
+    ln -sf /usr/bin/clang-format-14 /usr/bin/clang-format && \
+    ln -sf /usr/bin/clang-tidy-14 /usr/bin/clang-tidy
+
+# Install global npm packages needed for linting
+RUN npm install -g markdown-toc
+
+# Upgrade pip and install core Python packages
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install uv for faster Python package management
+RUN python3 -m pip install --no-cache-dir uv==0.8.*
+
+# Install lintrunner
+RUN python3 -m pip install --no-cache-dir lintrunner==0.12.7
+
+# Pre-install common Python linting dependencies to speed up lintrunner init
+# These versions should match what's in .lintrunner.toml
+RUN python3 -m pip install --no-cache-dir \
+    # FLAKE8 dependencies
+    flake8==7.3.0 \
+    flake8-bugbear==24.12.12 \
+    flake8-comprehensions==3.16.0 \
+    flake8-executable==2.1.3 \
+    flake8-logging-format==2024.24.12 \
+    flake8-pyi==25.5.0 \
+    flake8-simplify==0.22.0 \
+    mccabe==0.7.0 \
+    pycodestyle==2.14.0 \
+    pyflakes==3.4.0 \
+    # MYPY dependencies
+    mypy==1.16.0 \
+    types-requests==2.27.25 \
+    types-pyyaml==6.0.2 \
+    types-tabulate==0.8.8 \
+    types-protobuf==5.29.1.20250403 \
+    types-setuptools==79.0.0.20250422 \
+    types-jinja2==2.11.9 \
+    types-colorama==0.4.6 \
+    # PYFMT dependencies
+    usort==1.0.8.post1 \
+    isort==6.0.1 \
+    ruff==0.12.9 \
+    # Other common dependencies
+    expecttest==0.3.0 \
+    sympy==1.13.3 \
+    filelock==3.18.0 \
+    junitparser==2.1.1 \
+    rich==14.1.0 \
+    pyyaml==6.0.2 \
+    optree==0.13.0 \
+    dataclasses-json==0.6.7 \
+    pandas==2.2.3 \
+    # CMAKE linter
+    cmakelint==1.4.1 \
+    # SHELLCHECK
+    shellcheck-py==0.7.2.1 \
+    # NATIVEFUNCTIONS linter
+    ruamel.yaml==0.18.10 \
+    # CODESPELL
+    codespell[toml]==2.4.1 \
+    # PYPROJECT linter
+    packaging==25.0 \
+    tomli==2.2.1 \
+    # Additional PyTorch-specific dependencies
+    numpy==1.26.4
+
+# Install torchfix conditionally (Python version dependent)
+RUN python3 -c "import sys; sys.exit(0 if (3, 9) <= sys.version_info < (3, 13) else 1)" && \
+    python3 -m pip install --no-cache-dir torchfix==0.4.0 || true
+
+# Create a working directory
+WORKDIR /workspace
+
+# Set up environment variables for linting
+ENV PYTHONPATH=/workspace
+ENV PATH=/workspace/.lintbin:$PATH
+
+# Create cache directory for lintrunner binaries
+RUN mkdir -p /tmp/.lintbin
+
+# Pre-download and cache common lintrunner binaries
+# This is optional but speeds up subsequent runs
+RUN echo '[[linter]]\ncode = "CLANGFORMAT"\ninclude_patterns = ["**/*.cpp"]\ncommand = ["echo", "test"]\ninit_command = ["python3", "tools/linter/adapters/s3_init.py", "--config-json=tools/linter/adapters/s3_init_config.json", "--linter=clang-format", "--dry-run=true", "--output-dir=.lintbin", "--output-name=clang-format"]' > /tmp/test.toml || true
+
+# Set git safe directory (needed for git operations in containers)
+RUN git config --global --add safe.directory '*'
+
+# Add a non-root user for security (optional)
+RUN useradd -m -s /bin/bash linter && \
+    chown -R linter:linter /workspace /tmp/.lintbin
+USER linter
+
+# Default command
+CMD ["/bin/bash"]
