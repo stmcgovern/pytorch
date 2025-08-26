@@ -117,10 +117,10 @@ jobs:
           # Use uv to speed up lintrunner init
           python3 -m pip install -U uv==0.8.* setuptools
           
-          CACHE_DIRECTORY="/tmp/.lintbin"
+          CACHE_DIRECTORY=\"/tmp/.lintbin\"
           # Try to recover the cached binaries
-          if [[ -d "${CACHE_DIRECTORY}" ]]; then
-              cp -r "${CACHE_DIRECTORY}" . || true
+          if [ -d \"\$CACHE_DIRECTORY\" ]; then
+              cp -r \"\$CACHE_DIRECTORY\" . || true
           fi
           
           # This has already been cached in the docker image
@@ -203,9 +203,9 @@ jobs:
           # Use uv to speed up lintrunner init
           python3 -m pip install -U uv==0.8.* setuptools
           
-          CACHE_DIRECTORY="/tmp/.lintbin"
-          if [[ -d "${CACHE_DIRECTORY}" ]]; then
-              cp -r "${CACHE_DIRECTORY}" . || true
+          CACHE_DIRECTORY=\"/tmp/.lintbin\"
+          if [ -d \"\$CACHE_DIRECTORY\" ]; then
+              cp -r \"\$CACHE_DIRECTORY\" . || true
           fi
           
           lintrunner init 2> /dev/null
@@ -274,9 +274,9 @@ jobs:
           # Use uv to speed up lintrunner init
           python3 -m pip install -U uv==0.8.* setuptools
           
-          CACHE_DIRECTORY="/tmp/.lintbin"
-          if [[ -d "${CACHE_DIRECTORY}" ]]; then
-              cp -r "${CACHE_DIRECTORY}" . || true
+          CACHE_DIRECTORY=\"/tmp/.lintbin\"
+          if [ -d \"\$CACHE_DIRECTORY\" ]; then
+              cp -r \"\$CACHE_DIRECTORY\" . || true
           fi
           
           lintrunner init 2> /dev/null
@@ -344,15 +344,15 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
             pytorch-lint:latest \
-            bash -c "
+            bash -c '
           # Ensure no non-breaking spaces
-          (! git --no-pager grep -In "$(printf '\xC2\xA0')" -- . || (echo "The above lines have non-breaking spaces (U+00A0); please convert them to spaces (U+0020)"; false))
+          (! git --no-pager grep -In "$(printf '\''\xC2\xA0'\'')" -- . || (echo "The above lines have non-breaking spaces (U+00A0); please convert them to spaces (U+0020)"; false))
 
           # Ensure cross-OS compatible file names
-          (! git ls-files | grep -E '([<>:"|?*]|[ .]$)' || (echo "The above file names are not valid across all operating systems. Please ensure they don't contain the characters '<>:\"|?*' and don't end with a white space or a '.' "; false))
+          (! git ls-files | grep -E '\''([<>:"|?*]|[ .]$)'\'' || (echo "The above file names are not valid across all operating systems. Please ensure they don'\''t contain the characters '\''<>:\"|?*'\'' and don'\''t end with a white space or a '\''.'\'' "; false))
 
           # Ensure no versionless Python shebangs
-          (! git --no-pager grep -In '#!.*python$' -- . || (echo "The above lines have versionless Python shebangs; please specify either python2 or python3"; false))
+          (! git --no-pager grep -In '\''#!.*python$'\'' -- . || (echo "The above lines have versionless Python shebangs; please specify either python2 or python3"; false))
 
           # C++ docs check
           pushd docs/cpp/source
@@ -362,7 +362,7 @@ jobs:
           # CUDA kernel launch check
           set -eux
           python3 torch/testing/_internal/check_kernel_launches.py |& tee cuda_kernel_launch_checks.txt
-          "
+          '
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
