@@ -20,9 +20,9 @@ export USE_DISTRIBUTED=0
 export MAX_JOBS=$(nproc)
 
 echo "--- Building PyTorch with ASAN enabled (CUDA disabled) ---"
-python setup.py install
+python3 setup.py install
 
 echo "--- Running targeted tests ---"
 # Run a small, high-value set of tests.
-pytest test/test_torch.py test/test_nn.py
+python3 -m pytest test/test_torch.py test/test_nn.py
 
