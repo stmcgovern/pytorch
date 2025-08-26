@@ -2,7 +2,7 @@
 # Defines the reproducible build environment for the ASAN CI job.
 
 # Use a specific version of Ubuntu for consistency.
-FROM ubuntu:20.04
+FROM ubuntu:20.04 as dev-base
 
 # Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -34,7 +34,14 @@ WORKDIR /workspace
 # This layer will only be rebuilt if requirements.txt changes.
 COPY requirements.txt requirements-build.txt .
 RUN pip install -r requirements.txt
-RUN pip install mkl-static mkl-include
+RUN pip install mkl-static mkl-include pytest
+
+FROM dev-base as submodule-update
+WORKDIR /workspace
+COPY . .
+RUN git submodule update --init --recursive
+
+From submodule-update as final-layer
 # Copy the rest of the repository content into the container
 COPY . .
 
