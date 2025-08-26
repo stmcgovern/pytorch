@@ -57,6 +57,6 @@ jobs:
             -w /workspace \
             pytorch-asan-build \
             bash -c " \
-              git config --global --add safe.directory /workspace && \
+              git config --global --add safe.directory '*' && \
               chmod +x .github/scripts/run_asan_build.sh && \
               ./.github/scripts/run_asan_build.sh"
