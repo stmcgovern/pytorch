@@ -6,7 +6,6 @@ on:
       - 'main'
       - 'master'
 
-  workflow_dispatch:
 
 permissions: read-all
 
@@ -21,14 +20,30 @@ jobs:
         uses: actions/checkout@v4
         
       - name: Set up Docker Buildx
+        # This step sets up a builder instance that supports the GHA cache backend.
         uses: docker/setup-buildx-action@v3
-        
-      - name: Build and load lint image
-        id: build
-        run: |
-          IMAGE_TAG="pytorch-lint:${{ github.sha }}"
-          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          docker build -f ./github/docker/Dockerfile.lint -t $IMAGE_TAG .
+        with:
+          driver: docker-container
+
+      - name: Build and cache Docker image
+        # This action builds the image and handles caching automatically
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .github/docker/Dockerfile.lint
+          # We are not pushing to a registry, just loading into the local Docker daemon
+          push: false
+          load: true
+          tags: pytorch-lint-build:latest
+          # Configure caching to use the GitHub Actions cache backend
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # - name: Build and load lint image
+      #   id: build
+      #   run: |
+      #     IMAGE_TAG="pytorch-lint:${{ github.sha }}"
+      #     echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+      #     docker build -f ./github/docker/Dockerfile.lint -t $IMAGE_TAG .
 
   get-changed-files:
     name: Get changed files
