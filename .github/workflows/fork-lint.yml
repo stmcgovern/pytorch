@@ -112,10 +112,10 @@ jobs:
           git config --global --add safe.directory /workspace
           
           # Mirror the exact logic from PyTorch's lintrunner.sh
-          if [ "$CHANGED_FILES" = "*" ]; then
-            export ADDITIONAL_LINTRUNNER_ARGS="--take CLANGTIDY,CLANGFORMAT --all-files"
+          if [ \"\$CHANGED_FILES\" = \"*\" ]; then
+            export ADDITIONAL_LINTRUNNER_ARGS=\"--take CLANGTIDY,CLANGFORMAT --all-files\"
           else
-            export ADDITIONAL_LINTRUNNER_ARGS="--take CLANGTIDY,CLANGFORMAT $CHANGED_FILES"
+            export ADDITIONAL_LINTRUNNER_ARGS=\"--take CLANGTIDY,CLANGFORMAT \$CHANGED_FILES\"
           fi
           
           # Use uv to speed up lintrunner init
@@ -136,24 +136,24 @@ jobs:
           python3 -m tools.pyi.gen_pyi \
               --native-functions-path aten/src/ATen/native/native_functions.yaml \
               --tags-path aten/src/ATen/native/tags.yaml \
-              --deprecated-functions-path "tools/autograd/deprecated.yaml"
+              --deprecated-functions-path \"tools/autograd/deprecated.yaml\"
           python3 torch/utils/data/datapipes/gen_pyi.py
           
           # Also check generated pyi files
-          find torch -name '*.pyi' -exec git add --force -- "{}" +
+          find torch -name \"*.pyi\" -exec git add --force -- \"{}\" +
           
           RC=0
           # Run lintrunner on all files
-          if ! lintrunner --force-color --tee-json=lint.json ${ADDITIONAL_LINTRUNNER_ARGS} 2> /dev/null; then
-              echo ""
-              echo -e "\e[1m\e[36mYou can reproduce these results locally by using \`lintrunner -m origin/main\`. (If you don't get the same results, run \'lintrunner init\' to update your local linter)\e[0m"
-              echo -e "\e[1m\e[36mSee https://github.com/pytorch/pytorch/wiki/lintrunner for setup instructions. To apply suggested patches automatically, use the -a flag. Before pushing another commit,\e[0m"
-              echo -e "\e[1m\e[36mplease verify locally and ensure everything passes.\e[0m"
+          if ! lintrunner --force-color --tee-json=lint.json \$ADDITIONAL_LINTRUNNER_ARGS 2> /dev/null; then
+              echo \"\"
+              echo -e \"\\e[1m\\e[36mYou can reproduce these results locally by using \\`lintrunner -m origin/main\\`. (If you don't get the same results, run \\'lintrunner init\\' to update your local linter)\\e[0m\"
+              echo -e \"\\e[1m\\e[36mSee https://github.com/pytorch/pytorch/wiki/lintrunner for setup instructions. To apply suggested patches automatically, use the -a flag. Before pushing another commit,\\e[0m\"
+              echo -e \"\\e[1m\\e[36mplease verify locally and ensure everything passes.\\e[0m\"
               RC=1
           fi
           
           # Unstage temporally added pyi files
-          find torch -name '*.pyi' -exec git restore --staged -- "{}" +
+          find torch -name \"*.pyi\" -exec git restore --staged -- \"{}\" +
           
           # Use jq to massage the JSON lint output into GitHub Actions workflow commands.
           jq --raw-output \
@@ -222,19 +222,19 @@ jobs:
           python3 -m tools.pyi.gen_pyi \
               --native-functions-path aten/src/ATen/native/native_functions.yaml \
               --tags-path aten/src/ATen/native/tags.yaml \
-              --deprecated-functions-path "tools/autograd/deprecated.yaml"
+              --deprecated-functions-path \"tools/autograd/deprecated.yaml\"
           python3 torch/utils/data/datapipes/gen_pyi.py
           
-          find torch -name '*.pyi' -exec git add --force -- "{}" +
+          find torch -name \"*.pyi\" -exec git add --force -- \"{}\" +
           
           RC=0
-          if ! ADDITIONAL_LINTRUNNER_ARGS="--take MYPY,MYPYSTRICT --all-files" lintrunner --force-color --tee-json=lint.json ${ADDITIONAL_LINTRUNNER_ARGS} 2> /dev/null; then
-              echo ""
-              echo -e "\e[1m\e[36mYou can reproduce these results locally by using \`lintrunner -m origin/main\`.\e[0m"
+          if ! ADDITIONAL_LINTRUNNER_ARGS=\"--take MYPY,MYPYSTRICT --all-files\" lintrunner --force-color --tee-json=lint.json \$ADDITIONAL_LINTRUNNER_ARGS 2> /dev/null; then
+              echo \"\"
+              echo -e \"\\e[1m\\e[36mYou can reproduce these results locally by using \\`lintrunner -m origin/main\\`.\\e[0m\"
               RC=1
           fi
           
-          find torch -name '*.pyi' -exec git restore --staged -- "{}" +
+          find torch -name \"*.pyi\" -exec git restore --staged -- \"{}\" +
           
           jq --raw-output \
               '\"::\(if .severity == \"advice\" or .severity == \"disabled\" then \"warning\" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::\" + (.description | gsub(\"\\n\"; \"%0A\"))' \
@@ -297,28 +297,28 @@ jobs:
           python3 -m tools.pyi.gen_pyi \
               --native-functions-path aten/src/ATen/native/native_functions.yaml \
               --tags-path aten/src/ATen/native/tags.yaml \
-              --deprecated-functions-path "tools/autograd/deprecated.yaml"
+              --deprecated-functions-path \"tools/autograd/deprecated.yaml\"
           python3 torch/utils/data/datapipes/gen_pyi.py
           
-          find torch -name '*.pyi' -exec git add --force -- "{}" +
+          find torch -name \"*.pyi\" -exec git add --force -- \"{}\" +
           
           RC=0
-          if [ "$CHANGED_FILES" = '*' ]; then
-            if ! ADDITIONAL_LINTRUNNER_ARGS="--skip CLANGTIDY,CLANGFORMAT,MYPY,MYPYSTRICT --all-files" lintrunner --force-color --tee-json=lint.json ${ADDITIONAL_LINTRUNNER_ARGS} 2> /dev/null; then
+          if [ \"\$CHANGED_FILES\" = \"*\" ]; then
+            if ! ADDITIONAL_LINTRUNNER_ARGS=\"--skip CLANGTIDY,CLANGFORMAT,MYPY,MYPYSTRICT --all-files\" lintrunner --force-color --tee-json=lint.json \$ADDITIONAL_LINTRUNNER_ARGS 2> /dev/null; then
                 RC=1
             fi
           else
-            if ! ADDITIONAL_LINTRUNNER_ARGS="--skip CLANGTIDY,CLANGFORMAT,MYPY,MYPYSTRICT ${CHANGED_FILES}" lintrunner --force-color --tee-json=lint.json ${ADDITIONAL_LINTRUNNER_ARGS} 2> /dev/null; then
+            if ! ADDITIONAL_LINTRUNNER_ARGS=\"--skip CLANGTIDY,CLANGFORMAT,MYPY,MYPYSTRICT \$CHANGED_FILES\" lintrunner --force-color --tee-json=lint.json \$ADDITIONAL_LINTRUNNER_ARGS 2> /dev/null; then
                 RC=1
             fi
           fi
           
-          if [ $RC -ne 0 ]; then
-              echo ""
-              echo -e "\e[1m\e[36mYou can reproduce these results locally by using \`lintrunner -m origin/main\`.\e[0m"
+          if [ \$RC -ne 0 ]; then
+              echo \"\"
+              echo -e \"\\e[1m\\e[36mYou can reproduce these results locally by using \\`lintrunner -m origin/main\\`.\\e[0m\"
           fi
           
-          find torch -name '*.pyi' -exec git restore --staged -- "{}" +
+          find torch -name \"*.pyi\" -exec git restore --staged -- \"{}\" +
           
           jq --raw-output \
               '\"::\(if .severity == \"advice\" or .severity == \"disabled\" then \"warning\" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::\" + (.description | gsub(\"\\n\"; \"%0A\"))' \
