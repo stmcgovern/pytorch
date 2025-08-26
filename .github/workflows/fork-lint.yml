@@ -75,8 +75,6 @@ jobs:
       contains(needs.get-changed-files.outputs.changed-files, '.cuh') ||
       contains(needs.get-changed-files.outputs.changed-files, '.mm') ||
       contains(needs.get-changed-files.outputs.changed-files, '.metal')
-    container:
-      image: pytorch-lint:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -96,11 +94,19 @@ jobs:
           tags: pytorch-lint:latest
           cache-from: type=gha
           
-      - name: Run lintrunner script
+      - name: Run lintrunner script in container
         env:
           CHANGED_FILES: ${{ needs.get-changed-files.outputs.changed-files }}
           CLANG: "1"
         run: |
+          # Run linting inside the Docker container
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            -e CHANGED_FILES="$CHANGED_FILES" \
+            -e CLANG="$CLANG" \
+            pytorch-lint:latest \
+            bash -c "
           # Mirror the exact logic from PyTorch's lintrunner.sh
           if [ "$CHANGED_FILES" = "*" ]; then
             export ADDITIONAL_LINTRUNNER_ARGS="--take CLANGTIDY,CLANGFORMAT --all-files"
@@ -147,10 +153,11 @@ jobs:
           
           # Use jq to massage the JSON lint output into GitHub Actions workflow commands.
           jq --raw-output \
-              '"::\(if .severity == "advice" or .severity == "disabled" then "warning" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::" + (.description | gsub("\\n"; "%0A"))' \
+              '\"::\(if .severity == \"advice\" or .severity == \"disabled\" then \"warning\" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::\" + (.description | gsub(\"\\n\"; \"%0A\"))' \
               lint.json || true
           
           exit $RC
+          "
 
   lintrunner-mypy:
     name: lintrunner-mypy
@@ -161,8 +168,6 @@ jobs:
       needs.get-changed-files.outputs.changed-files == '*' ||
       contains(needs.get-changed-files.outputs.changed-files, '.py') ||
       contains(needs.get-changed-files.outputs.changed-files, '.pyi')
-    container:
-      image: pytorch-lint:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -182,11 +187,18 @@ jobs:
           tags: pytorch-lint:latest
           cache-from: type=gha
           
-      - name: Run mypy linting
+      - name: Run mypy linting in container
         env:
           CHANGED_FILES: ${{ needs.get-changed-files.outputs.changed-files }}
         run: |
-          echo "Running mypy"
+          # Run mypy inside the Docker container
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            -e CHANGED_FILES="$CHANGED_FILES" \
+            pytorch-lint:latest \
+            bash -c "
+          echo \"Running mypy\"
           
           # Use uv to speed up lintrunner init
           python3 -m pip install -U uv==0.8.* setuptools
@@ -217,17 +229,16 @@ jobs:
           find torch -name '*.pyi' -exec git restore --staged -- "{}" +
           
           jq --raw-output \
-              '"::\(if .severity == "advice" or .severity == "disabled" then "warning" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::" + (.description | gsub("\\n"; "%0A"))' \
+              '\"::\(if .severity == \"advice\" or .severity == \"disabled\" then \"warning\" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::\" + (.description | gsub(\"\\n\"; \"%0A\"))' \
               lint.json || true
           
           exit $RC
+          "
 
   lintrunner-noclang:
     name: lintrunner-noclang
     runs-on: ubuntu-latest
     needs: [build-lint-image, get-changed-files]
-    container:
-      image: pytorch-lint:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -247,11 +258,18 @@ jobs:
           tags: pytorch-lint:latest
           cache-from: type=gha
           
-      - name: Run all other linters
+      - name: Run all other linters in container
         env:
           CHANGED_FILES: ${{ needs.get-changed-files.outputs.changed-files }}
         run: |
-          echo "Running all other linters"
+          # Run linting inside the Docker container
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            -e CHANGED_FILES="$CHANGED_FILES" \
+            pytorch-lint:latest \
+            bash -c "
+          echo \"Running all other linters\"
           
           # Use uv to speed up lintrunner init
           python3 -m pip install -U uv==0.8.* setuptools
@@ -291,17 +309,16 @@ jobs:
           find torch -name '*.pyi' -exec git restore --staged -- "{}" +
           
           jq --raw-output \
-              '"::\(if .severity == "advice" or .severity == "disabled" then "warning" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::" + (.description | gsub("\\n"; "%0A"))' \
+              '\"::\(if .severity == \"advice\" or .severity == \"disabled\" then \"warning\" else .severity end) file=\(.path),line=\(.line),col=\(.char),title=\(.code) \(.name)::\" + (.description | gsub(\"\\n\"; \"%0A\"))' \
               lint.json || true
           
           exit $RC
+          "
 
   quick-checks:
     name: quick-checks
     runs-on: ubuntu-latest
     needs: build-lint-image
-    container:
-      image: pytorch-lint:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -320,8 +337,14 @@ jobs:
           tags: pytorch-lint:latest
           cache-from: type=gha
           
-      - name: Run quick checks
+      - name: Run quick checks in container
         run: |
+          # Run quick checks inside the Docker container
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            pytorch-lint:latest \
+            bash -c "
           # Ensure no non-breaking spaces
           (! git --no-pager grep -In "$(printf '\xC2\xA0')" -- . || (echo "The above lines have non-breaking spaces (U+00A0); please convert them to spaces (U+0020)"; false))
 
@@ -339,6 +362,7 @@ jobs:
           # CUDA kernel launch check
           set -eux
           python3 torch/testing/_internal/check_kernel_launches.py |& tee cuda_kernel_launch_checks.txt
+          "
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
