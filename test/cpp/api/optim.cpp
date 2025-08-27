@@ -564,3 +564,96 @@ TEST(OptimTest, CheckLRChange_ReduceLROnPlateau_Adam) {
   check_lr_change_for_reduce_on_plateau(
       optimizer, reduce_lr_on_plateau_scheduler, expected_epoch_lrs);
 }
+
+TEST(OptimTest, Issue141884_AdamOptimizerDefaultOptions) {
+  // Test single parameter group scenario
+  {
+    auto param = torch::ones({2, 2}, torch::requires_grad(true));
+    std::vector<torch::optim::OptimizerParamGroup> param_groups;
+    param_groups.emplace_back(
+        std::vector<torch::Tensor>{param},
+        std::make_unique<torch::optim::AdamOptions>(
+            torch::optim::AdamOptions().lr(0.005)));
+
+    torch::optim::AdamOptions defaults;
+    defaults.lr(0.1).weight_decay(0.02).eps(1e-7).amsgrad(false);
+
+    torch::optim::Adam optimizer(param_groups, defaults);
+    auto& adam_opts = static_cast<torch::optim::AdamOptions&>(
+        optimizer.param_groups()[0].options());
+
+    EXPECT_DOUBLE_EQ(adam_opts.lr(), 0.005);
+    EXPECT_DOUBLE_EQ(adam_opts.weight_decay(), 0.02);
+    EXPECT_DOUBLE_EQ(adam_opts.eps(), 1e-7);
+    EXPECT_FALSE(adam_opts.amsgrad());
+  }
+
+  // Test multiple parameter groups scenario
+  {
+    auto input = torch::ones({1, 3}, torch::requires_grad(true));
+    auto w = torch::ones({2, 3}, torch::requires_grad(true));
+    auto b = torch::ones({1, 2}, torch::requires_grad(true));
+
+    std::vector<torch::optim::OptimizerParamGroup> param_groups;
+    param_groups.emplace_back(
+        std::vector<torch::Tensor>{input},
+        std::make_unique<torch::optim::AdamOptions>(
+            torch::optim::AdamOptions().lr(0.01)));
+    param_groups.emplace_back(
+        std::vector<torch::Tensor>{w},
+        std::make_unique<torch::optim::AdamOptions>(
+            torch::optim::AdamOptions().lr(0.02)));
+    param_groups.emplace_back(
+        std::vector<torch::Tensor>{b},
+        std::make_unique<torch::optim::AdamOptions>(
+            torch::optim::AdamOptions().lr(0.03)));
+
+    torch::optim::AdamOptions default_opts;
+    default_opts.lr(0.001).weight_decay(0.05).eps(1e-9)
+               .betas(std::make_tuple(0.95, 0.999));
+
+    torch::optim::Adam optimizer(param_groups, default_opts);
+    auto& groups = optimizer.param_groups();
+    EXPECT_EQ(groups.size(), 3);
+
+    std::vector<double> expected_lrs = {0.01, 0.02, 0.03};
+    for (size_t i = 0; i < groups.size(); i++) {
+      auto& adam_opts = static_cast<torch::optim::AdamOptions&>(groups[i].options());
+      EXPECT_DOUBLE_EQ(adam_opts.lr(), expected_lrs[i]);
+      EXPECT_DOUBLE_EQ(adam_opts.weight_decay(), 0.05);
+      EXPECT_DOUBLE_EQ(adam_opts.eps(), 1e-9);
+
+      auto betas = adam_opts.betas();
+      EXPECT_DOUBLE_EQ(std::get<0>(betas), 0.95);
+      EXPECT_DOUBLE_EQ(std::get<1>(betas), 0.999);
+    }
+  }
+}
+
+template<typename OptimizerType, typename OptionsType>
+void test_optimizer_bug_universally(const std::string& optimizer_name) {
+  auto param = torch::ones({2, 2}, torch::requires_grad(true));
+  std::vector<torch::optim::OptimizerParamGroup> param_groups;
+
+  constexpr double param_group_lr = 0.007;
+  auto param_opts = std::make_unique<OptionsType>(param_group_lr);
+  param_groups.emplace_back(std::vector<torch::Tensor>{param}, std::move(param_opts));
+
+  constexpr double defaults_lr = 0.001;
+  OptionsType defaults(defaults_lr);
+
+  OptimizerType optimizer(param_groups, defaults);
+  auto& final_opts = static_cast<OptionsType&>(optimizer.param_groups()[0].options());
+
+  EXPECT_DOUBLE_EQ(final_opts.lr(), param_group_lr);
+  EXPECT_NE(final_opts.lr(), defaults_lr);
+}
+
+TEST(OptimTest, Issue141884_CheckAllOptimizers) {
+  test_optimizer_bug_universally<torch::optim::Adam, torch::optim::AdamOptions>("Adam");
+  test_optimizer_bug_universally<torch::optim::SGD, torch::optim::SGDOptions>("SGD");
+  test_optimizer_bug_universally<torch::optim::AdamW, torch::optim::AdamWOptions>("AdamW");
+  test_optimizer_bug_universally<torch::optim::RMSprop, torch::optim::RMSpropOptions>("RMSprop");
+  test_optimizer_bug_universally<torch::optim::Adagrad, torch::optim::AdagradOptions>("Adagrad");
+  test_optimizer_bug_universally<torch::optim::LBFGS, torch::optim::LBFGSOptions>("LBFGS");
+}

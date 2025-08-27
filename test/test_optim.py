@@ -2306,6 +2306,151 @@ class TestOptimRenewed(TestCase):
                 self.assertGreater(len(state), 0)
 
 
+class TestOptimizerDefaults(TestCase):
+    """Test universal optimizer fix behavior for Issue #141884."""
+
+    def test_adam_universal_optimizer_fix_issue_141884(self):
+        """
+        Test universal optimizer fix for PyTorch issue #141884.
+        Param groups inherit all defaults except learning rate.
+        """
+        # Create test tensors
+        input_tensor = torch.ones(1, 3, requires_grad=True)
+        w = torch.ones(2, 3, requires_grad=True)
+        b = torch.ones(1, 2, requires_grad=True)
+
+        # Create Adam optimizer with different learning rates per group
+        # All other options should inherit from defaults
+        optimizer = torch.optim.Adam(
+            [
+                {"params": [input_tensor], "lr": 0.01},
+                {"params": [w], "lr": 0.02},
+                {"params": [b], "lr": 0.03},
+            ],
+            lr=0.001,  # Default lr (will be overridden by param groups)
+            weight_decay=0.05,  # Should be inherited by all groups
+            eps=1e-9,  # Should be inherited by all groups
+            betas=(0.95, 0.999),  # Should be inherited by all groups
+        )
+
+        # Verify universal merge behavior
+        groups = optimizer.param_groups
+        self.assertEqual(len(groups), 3)
+
+        expected_lrs = [0.01, 0.02, 0.03]
+
+        for i, group in enumerate(groups):
+            # lr should be group-specific
+            self.assertEqual(
+                group["lr"], expected_lrs[i], f"Group {i} should have its specific lr"
+            )
+
+            # All other options should be inherited from defaults
+            self.assertEqual(
+                group["weight_decay"],
+                0.05,
+                f"Group {i} should inherit weight_decay from defaults",
+            )
+            self.assertEqual(
+                group["eps"],
+                1e-9,
+                f"Group {i} should inherit eps from defaults",
+            )
+            self.assertEqual(
+                group["betas"],
+                (0.95, 0.999),
+                f"Group {i} should inherit betas from defaults",
+            )
+
+    def test_adam_universal_merge_behavior_issue_141884(self):
+        """
+        Test universal merge behavior: lr from param group, others from defaults.
+        """
+        param = torch.randn(3, requires_grad=True)
+
+        # Create param group with custom lr - other options should inherit from defaults
+        optimizer = torch.optim.Adam(
+            [{"params": [param], "lr": 0.005}],
+            lr=0.1,  # Will be overridden by param group
+            weight_decay=0.02,  # Should be inherited
+            eps=1e-7,  # Should be inherited
+            amsgrad=False,  # Should be inherited
+        )
+
+        group = optimizer.param_groups[0]
+
+        # Universal merge behavior: lr from param group, others from defaults
+        self.assertEqual(group["lr"], 0.005)  # From param group
+        self.assertEqual(group["weight_decay"], 0.02)  # From defaults
+        self.assertEqual(group["eps"], 1e-7)  # From defaults
+        self.assertEqual(group["amsgrad"], False)  # From defaults
+
+    def test_sgd_universal_optimizer_fix_issue_141884(self):
+        """
+        Test that universal optimizer fix works for SGD as well.
+        """
+        param1 = torch.randn(5, requires_grad=True)
+        param2 = torch.randn(5, requires_grad=True)
+
+        # Create SGD optimizer with different learning rates
+        optimizer = torch.optim.SGD(
+            [
+                {"params": [param1], "lr": 0.01},
+                {"params": [param2], "lr": 0.05},
+            ],
+            lr=0.1,  # Default lr (will be overridden)
+            momentum=0.9,  # Should be inherited
+            weight_decay=0.001,  # Should be inherited
+            dampening=0.05,  # Should be inherited
+        )
+
+        groups = optimizer.param_groups
+        self.assertEqual(len(groups), 2)
+
+        # Group 1: lr from param group, others from defaults
+        self.assertEqual(groups[0]["lr"], 0.01)  # From param group
+        self.assertEqual(groups[0]["momentum"], 0.9)  # From defaults
+        self.assertEqual(groups[0]["weight_decay"], 0.001)  # From defaults
+        self.assertEqual(groups[0]["dampening"], 0.05)  # From defaults
+
+        # Group 2: lr from param group, others from defaults
+        self.assertEqual(groups[1]["lr"], 0.05)  # From param group
+        self.assertEqual(groups[1]["momentum"], 0.9)  # From defaults
+        self.assertEqual(groups[1]["weight_decay"], 0.001)  # From defaults
+        self.assertEqual(groups[1]["dampening"], 0.05)  # From defaults
+
+    def test_universal_optimizer_merge_generic(self):
+        """Generic test that verifies lr inheritance works for any optimizer."""
+
+        def test_optimizer_type(
+            optimizer_class, param_group_lr, defaults_lr, **default_kwargs
+        ):
+            param = torch.randn(3, requires_grad=True)
+            optimizer = optimizer_class(
+                [{"params": [param], "lr": param_group_lr}],
+                lr=defaults_lr,
+                **default_kwargs,
+            )
+            group = optimizer.param_groups[0]
+            # lr should come from param group
+            self.assertEqual(group["lr"], param_group_lr)
+            # other options should come from defaults
+            for key, expected_value in default_kwargs.items():
+                self.assertEqual(
+                    group[key],
+                    expected_value,
+                    f"{optimizer_class.__name__} should inherit {key} from defaults",
+                )
+
+        # Test all optimizer types with the same generic logic
+        test_optimizer_type(torch.optim.Adam, 0.001, 0.01, weight_decay=0.1, eps=1e-6)
+        test_optimizer_type(
+            torch.optim.SGD, 0.002, 0.02, momentum=0.95, weight_decay=0.2
+        )
+        test_optimizer_type(torch.optim.AdamW, 0.003, 0.03, weight_decay=0.15, eps=1e-7)
+        test_optimizer_type(torch.optim.RMSprop, 0.004, 0.04, alpha=0.95, momentum=0.8)
+
+
 instantiate_device_type_tests(TestOptimRenewed, globals(), allow_mps=True)
 
 
