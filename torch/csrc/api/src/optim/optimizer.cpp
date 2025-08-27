@@ -1,6 +1,7 @@
 #include <torch/optim/optimizer.h>
 
 #include <torch/csrc/autograd/generated/variable_factories.h>
+#include <torch/optim/adam.h>
 #include <torch/types.h>
 
 #include <string>
@@ -103,7 +104,19 @@ void Optimizer::add_param_group(const OptimizerParamGroup& param_group) {
   if (!param_group.has_options()) {
     param_group_.set_options(defaults_->clone());
   } else {
-    param_group_.set_options(param_group.options().clone());
+    // Merge param group options with defaults - for AdamOptions only
+    // Try to cast to AdamOptions to provide proper merging
+    auto* default_adam = dynamic_cast<torch::optim::AdamOptions*>(defaults_.get());
+    auto* param_adam = dynamic_cast<const torch::optim::AdamOptions*>(&param_group.options());
+    
+    if (default_adam && param_adam) {
+      // Create merged options using the merge_in method
+      auto merged_options = std::make_unique<torch::optim::AdamOptions>(default_adam->merge_in(*param_adam));
+      param_group_.set_options(std::move(merged_options));
+    } else {
+      // Fallback to original behavior for other optimizer types
+      param_group_.set_options(param_group.options().clone());
+    }
   }
   for (const auto& p : param_group_.params()) {
     TORCH_CHECK(

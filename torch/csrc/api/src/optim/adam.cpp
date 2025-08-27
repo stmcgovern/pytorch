@@ -48,6 +48,31 @@ void AdamOptions::set_lr(const double lr) {
   this->lr(lr);
 }
 
+AdamOptions AdamOptions::merge_in(const AdamOptions& other) const {
+  AdamOptions merged = *this; // Start with base (defaults)
+  AdamOptions fresh_defaults; // Fresh instance to compare against
+  
+  // Only override fields in 'other' that differ from a fresh AdamOptions
+  // This heuristic assumes that users only set fields they care about
+  if (other.lr() != fresh_defaults.lr()) {
+    merged.lr(other.lr());
+  }
+  if (other.betas() != fresh_defaults.betas()) {
+    merged.betas(other.betas());
+  }
+  if (other.eps() != fresh_defaults.eps()) {
+    merged.eps(other.eps());
+  }
+  if (other.weight_decay() != fresh_defaults.weight_decay()) {
+    merged.weight_decay(other.weight_decay());
+  }
+  if (other.amsgrad() != fresh_defaults.amsgrad()) {
+    merged.amsgrad(other.amsgrad());
+  }
+  
+  return merged;
+}
+
 bool operator==(const AdamParamState& lhs, const AdamParamState& rhs) {
   return (lhs.step() == rhs.step()) &&
       torch::equal(lhs.exp_avg(), rhs.exp_avg()) &&

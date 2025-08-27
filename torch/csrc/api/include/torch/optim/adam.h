@@ -24,6 +24,7 @@ struct TORCH_API AdamOptions : public OptimizerCloneableOptions<AdamOptions> {
   TORCH_ARG(bool, amsgrad) = false;
 
  public:
+  AdamOptions merge_in(const AdamOptions& other) const;
   void serialize(torch::serialize::InputArchive& archive) override;
   void serialize(torch::serialize::OutputArchive& archive) const override;
   TORCH_API friend bool operator==(
