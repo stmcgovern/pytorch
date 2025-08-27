@@ -2306,6 +2306,126 @@ class TestOptimRenewed(TestCase):
                 self.assertGreater(len(state), 0)
 
 
+class TestOptimizerDefaults(TestCase):
+    """Test default option inheritance behavior for optimizers."""
+
+    def test_adam_default_options_inheritance_issue_141884(self):
+        """
+        Regression test for PyTorch issue #141884.
+        When parameter groups have partial options, defaults should be inherited.
+        """
+        # Create test tensors
+        input_tensor = torch.ones(1, 3, requires_grad=True)
+        w = torch.ones(2, 3, requires_grad=True)
+        b = torch.ones(1, 2, requires_grad=True)
+
+        # Create Adam optimizer with partial parameter group options
+        # Only weight_decay specified, lr should inherit from defaults
+        optimizer = torch.optim.Adam(
+            [
+                {"params": [input_tensor], "weight_decay": 0.11},
+                {"params": [w], "weight_decay": 0.22},
+                {"params": [b], "weight_decay": 0.33},
+            ],
+            lr=0.0,
+        )  # Default lr=0 should be inherited by all groups
+
+        # Compute gradients
+        output = torch.nn.functional.linear(input_tensor, w, b)
+        output.sum().backward()
+
+        # Store original parameter values
+        orig_input = input_tensor.clone().detach()
+        orig_w = w.clone().detach()
+        orig_b = b.clone().detach()
+
+        # Take optimizer step - should NOT change parameters since lr=0
+        optimizer.step()
+
+        # Verify parameters didn't change (since lr=0 was inherited)
+        self.assertTrue(torch.allclose(input_tensor, orig_input, atol=1e-6))
+        self.assertTrue(torch.allclose(w, orig_w, atol=1e-6))
+        self.assertTrue(torch.allclose(b, orig_b, atol=1e-6))
+
+        # Verify that all param groups inherited lr=0 from defaults
+        groups = optimizer.param_groups
+        self.assertEqual(len(groups), 3)
+
+        for i, group in enumerate(groups):
+            # lr should be 0 (inherited from defaults)
+            self.assertEqual(
+                group["lr"], 0.0, f"Group {i} should inherit lr=0 from defaults"
+            )
+
+            # weight_decay should be group-specific
+            expected_wd = 0.11 + i * 0.11
+            self.assertEqual(
+                group["weight_decay"],
+                expected_wd,
+                f"Group {i} should have its specific weight_decay",
+            )
+
+    def test_adam_explicit_options_override_defaults_issue_141884(self):
+        """
+        Test backwards compatibility: explicit options should override defaults.
+        """
+        param = torch.randn(3, requires_grad=True)
+
+        # All options explicitly set should override defaults
+        optimizer = torch.optim.Adam(
+            [{"params": [param], "lr": 0.001, "weight_decay": 0.01, "eps": 1e-9}],
+            lr=0.1,
+            weight_decay=0.1,
+            eps=1e-7,
+        )  # Different defaults
+
+        group = optimizer.param_groups[0]
+
+        # Should use param group values, not defaults
+        self.assertEqual(group["lr"], 0.001)
+        self.assertEqual(group["weight_decay"], 0.01)
+        self.assertEqual(group["eps"], 1e-9)
+
+    def test_adam_mixed_partial_explicit_options_issue_141884(self):
+        """
+        Test mixed scenario: some groups with partial, some with explicit options.
+        """
+        param1 = torch.randn(5, requires_grad=True)
+        param2 = torch.randn(5, requires_grad=True)
+        param3 = torch.randn(5, requires_grad=True)
+
+        optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": [param1],
+                    "weight_decay": 0.01,
+                },  # Partial: lr should inherit
+                {"params": [param2], "lr": 0.002, "weight_decay": 0.02},  # Explicit lr
+                {"params": [param3]},  # No options: should inherit all defaults
+            ],
+            lr=0.001,
+            weight_decay=0.05,
+            eps=1e-8,
+        )
+
+        groups = optimizer.param_groups
+
+        # Group 1: lr inherited, weight_decay explicit
+        self.assertEqual(groups[0]["lr"], 0.001)
+        self.assertEqual(groups[0]["weight_decay"], 0.01)
+        self.assertEqual(groups[0]["eps"], 1e-8)  # Inherited
+
+        # Group 2: lr explicit, weight_decay explicit
+        self.assertEqual(groups[1]["lr"], 0.002)
+        self.assertEqual(groups[1]["weight_decay"], 0.02)
+        self.assertEqual(groups[1]["eps"], 1e-8)  # Inherited
+
+        # Group 3: all inherited
+        self.assertEqual(groups[2]["lr"], 0.001)
+        self.assertEqual(groups[2]["weight_decay"], 0.05)
+        self.assertEqual(groups[2]["eps"], 1e-8)
+
+
 instantiate_device_type_tests(TestOptimRenewed, globals(), allow_mps=True)
 
 

@@ -564,3 +564,107 @@ TEST(OptimTest, CheckLRChange_ReduceLROnPlateau_Adam) {
   check_lr_change_for_reduce_on_plateau(
       optimizer, reduce_lr_on_plateau_scheduler, expected_epoch_lrs);
 }
+
+// Regression test for PyTorch issue 141884
+// Default optimizer options should be inherited when param groups have partial
+// options
+TEST(OptimTest, DefaultOptionsInheritance_Issue141884) {
+  auto input = torch::ones({1, 3}, torch::requires_grad(true));
+  auto w = torch::ones({2, 3}, torch::requires_grad(true));
+  auto b = torch::ones({1, 2}, torch::requires_grad(true));
+
+  // Create parameter groups with partial options (like in the original issue)
+  std::vector<torch::optim::OptimizerParamGroup> param_groups;
+
+  // Group 1: Only weight_decay set, lr should inherit from defaults
+  param_groups.emplace_back(
+      std::vector<torch::Tensor>{input},
+      std::make_unique<torch::optim::AdamOptions>(
+          torch::optim::AdamOptions().weight_decay(0.11)));
+
+  // Group 2: Only weight_decay set, lr should inherit from defaults
+  param_groups.emplace_back(
+      std::vector<torch::Tensor>{w},
+      std::make_unique<torch::optim::AdamOptions>(
+          torch::optim::AdamOptions().weight_decay(0.22)));
+
+  // Group 3: Only weight_decay set, lr should inherit from defaults
+  param_groups.emplace_back(
+      std::vector<torch::Tensor>{b},
+      std::make_unique<torch::optim::AdamOptions>(
+          torch::optim::AdamOptions().weight_decay(0.33)));
+
+  // Create optimizer with lr=0 as default (the key part of the issue)
+  torch::optim::AdamOptions default_opts;
+  default_opts.lr(0.0); // This should be inherited by all param groups
+
+  torch::optim::Adam optimizer(param_groups, default_opts);
+
+  auto output = torch::nn::functional::linear(input, w, b);
+  output.sum().backward();
+
+  // Store original parameter values
+  auto orig_input = input.clone().detach();
+  auto orig_w = w.clone().detach();
+  auto orig_b = b.clone().detach();
+
+  // Take optimizer step - should NOT change parameters since lr=0
+  optimizer.step();
+
+  // Verify parameters didn't change (since lr=0 was inherited)
+  EXPECT_TRUE(torch::allclose(input, orig_input, 1e-6));
+  EXPECT_TRUE(torch::allclose(w, orig_w, 1e-6));
+  EXPECT_TRUE(torch::allclose(b, orig_b, 1e-6));
+
+  // Verify that all param groups inherited lr=0 from defaults
+  auto& groups = optimizer.param_groups();
+  EXPECT_EQ(groups.size(), 3);
+
+  for (size_t i = 0; i < groups.size(); i++) {
+    auto& adam_opts =
+        static_cast<torch::optim::AdamOptions&>(groups[i].options());
+
+    // lr should be 0 (inherited from defaults)
+    EXPECT_DOUBLE_EQ(adam_opts.lr(), 0.0)
+        << "Group " << i << " should inherit lr=0 from defaults";
+
+    // weight_decay should be group-specific
+    double expected_wd = 0.11 + i * 0.11;
+    EXPECT_DOUBLE_EQ(adam_opts.weight_decay(), expected_wd)
+        << "Group " << i << " should have its specific weight_decay";
+  }
+}
+
+// Test backwards compatibility - explicit options should override defaults
+TEST(OptimTest, ExplicitOptionsOverrideDefaults_Issue141884) {
+  auto param = torch::ones({2, 2}, torch::requires_grad(true));
+
+  // Create param group with ALL options set explicitly
+  std::vector<torch::optim::OptimizerParamGroup> param_groups;
+  param_groups.emplace_back(
+      std::vector<torch::Tensor>{param},
+      std::make_unique<torch::optim::AdamOptions>(torch::optim::AdamOptions()
+                                                      .lr(0.005)
+                                                      .weight_decay(0.01)
+                                                      .eps(1e-9)
+                                                      .amsgrad(true)));
+
+  // Different defaults - should be overridden by param group
+  torch::optim::AdamOptions defaults;
+  defaults.lr(0.1).weight_decay(0.1).eps(1e-7).amsgrad(false);
+
+  torch::optim::Adam optimizer(param_groups, defaults);
+
+  // Verify param group options override defaults completely
+  auto& groups = optimizer.param_groups();
+  EXPECT_EQ(groups.size(), 1);
+
+  auto& adam_opts =
+      static_cast<torch::optim::AdamOptions&>(groups[0].options());
+
+  // Should use param group values, not defaults
+  EXPECT_DOUBLE_EQ(adam_opts.lr(), 0.005);
+  EXPECT_DOUBLE_EQ(adam_opts.weight_decay(), 0.01);
+  EXPECT_DOUBLE_EQ(adam_opts.eps(), 1e-9);
+  EXPECT_TRUE(adam_opts.amsgrad());
+}
