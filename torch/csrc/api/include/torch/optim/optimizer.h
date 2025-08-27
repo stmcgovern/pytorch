@@ -64,12 +64,33 @@ class TORCH_API OptimizerOptions {
   virtual ~OptimizerOptions() = default;
   virtual double get_lr() const;
   virtual void set_lr(const double lr);
+  virtual std::unique_ptr<OptimizerOptions> merge_with_defaults(
+      const OptimizerOptions& defaults) const;
 };
 
 template <typename Derived>
 class OptimizerCloneableOptions : public OptimizerOptions {
  private:
   std::unique_ptr<OptimizerOptions> clone() const override {
+    return std::make_unique<Derived>(static_cast<const Derived&>(*this));
+  }
+
+ public:
+  std::unique_ptr<OptimizerOptions> merge_with_defaults(
+      const OptimizerOptions& defaults) const override {
+    const auto* typed_defaults = dynamic_cast<const Derived*>(&defaults);
+    if (typed_defaults) {
+      // Start with defaults, override with param group's learning rate
+      // This handles the most common use case where users only specify lr
+      Derived merged = *typed_defaults; // Start with all defaults
+      const Derived& param_group = static_cast<const Derived&>(*this);
+
+      // Always preserve the learning rate from param group
+      merged.lr(param_group.lr());
+
+      return std::make_unique<Derived>(merged);
+    }
+    // Fallback if types don't match (shouldn't happen in normal usage)
     return std::make_unique<Derived>(static_cast<const Derived&>(*this));
   }
 };

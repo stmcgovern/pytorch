@@ -94,6 +94,12 @@ void OptimizerOptions::serialize(
       "You must override it in your subclass of torch::optim::OptimizerCloneableOptions<YourOptimizerOptions>.");
 }
 
+std::unique_ptr<OptimizerOptions> OptimizerOptions::merge_with_defaults(
+    const OptimizerOptions& defaults) const {
+  // Default implementation: use param group options (backwards compatible)
+  return this->clone();
+}
+
 void Optimizer::add_param_group(const OptimizerParamGroup& param_group) {
   for (const auto& param : param_group.params()) {
     TORCH_CHECK(param.is_leaf(), "can't optimize a non-leaf Tensor");
@@ -103,7 +109,9 @@ void Optimizer::add_param_group(const OptimizerParamGroup& param_group) {
   if (!param_group.has_options()) {
     param_group_.set_options(defaults_->clone());
   } else {
-    param_group_.set_options(param_group.options().clone());
+    // Use generic merge method that works for all optimizers
+    auto merged_options = param_group.options().merge_with_defaults(*defaults_);
+    param_group_.set_options(std::move(merged_options));
   }
   for (const auto& p : param_group_.params()) {
     TORCH_CHECK(
