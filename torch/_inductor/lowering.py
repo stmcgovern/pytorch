@@ -4922,11 +4922,11 @@ def max_pool2d_with_indices_backward(
 
     window_size = h_window_size * w_window_size
 
-    if window_size > 25:
-        # Kernel size too big. Results in hard-to-optimize Triton code. Use fallback.
-        return fallback_max_pool2d_with_indices_backward(
-            grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
-        )
+    # TEMPORARILY REMOVED for testing: if window_size > 25:
+    #     # Kernel size too big. Results in hard-to-optimize Triton code. Use fallback.
+    #     return fallback_max_pool2d_with_indices_backward(
+    #         grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
+    #     )
 
     indices_size = indices.get_size()
 
