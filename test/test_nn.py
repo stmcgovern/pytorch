@@ -10784,6 +10784,56 @@ class TestNNDeviceType(NNTestCase):
         pt_res = self._slow_masked_softmax(input, mask)
         self.assertEqual(pt_res, native_res, exact_dtype=True)
 
+    @deviceCountAtLeast(1)
+    @dtypes(torch.float32, torch.float64)
+    def test_masked_softmax_fully_masked_rows_no_nan(self, device, dtype):
+        """
+        Test that fully masked rows produce zeros, not NaN
+        Regression test for: https://github.com/pytorch/pytorch/issues/XXXXX
+        TransformerEncoder NaN bug with fully padded sequences
+        """
+        # Test with 4D mask (mask_type=2) - most general case
+        scores = torch.randn(2, 3, 4, 8, dtype=dtype, device=device)
+        mask = torch.zeros(2, 3, 4, 8, dtype=torch.bool, device=device)
+        mask[0, 0, 1, :] = True  # Fully mask row [0,0,1,:]
+        mask[1, 1, 2, :] = True  # Fully mask row [1,1,2,:]
+
+        result = torch._masked_softmax(scores, mask, dim=-1, mask_type=2)
+
+        # Check: should not produce NaN
+        self.assertFalse(torch.isnan(result).any(),
+                        "masked_softmax should not produce NaN for fully masked rows")
+
+        # Fully masked rows should be all zeros
+        expected = torch.zeros(8, dtype=dtype, device=device)
+        self.assertTrue(torch.allclose(result[0, 0, 1, :], expected),
+                       "Fully masked row should be all zeros")
+        self.assertTrue(torch.allclose(result[1, 1, 2, :], expected),
+                       "Fully masked row should be all zeros")
+
+        # Non-masked rows should sum to 1 (valid probability distribution)
+        non_masked_sum = result[0, 0, 0, :].sum()
+        self.assertTrue(torch.allclose(non_masked_sum, torch.tensor(1.0, dtype=dtype, device=device)),
+                       "Non-masked rows should sum to 1")
+
+    @deviceCountAtLeast(1)
+    @dtypes(torch.float64)
+    def test_masked_softmax_fully_masked_gradcheck(self, device, dtype):
+        """
+        Gradcheck test for fully masked rows
+        Verifies backward pass correctness with NaN handling
+        """
+        scores = torch.randn(4, 8, dtype=dtype, requires_grad=True, device=device)
+        mask = torch.zeros(4, 8, dtype=torch.bool, device=device)
+        mask[1, :] = True  # Fully mask row 1
+        mask[3, :] = True  # Fully mask row 3
+
+        def func(x):
+            return torch._masked_softmax(x, mask, dim=-1, mask_type=2)
+
+        # Gradcheck verifies numerical gradient matches autograd gradient
+        torch.autograd.gradcheck(func, scores, eps=1e-6, atol=1e-4)
+
     @onlyCPU
     @dtypes(torch.bfloat16, torch.half)
     def test_log_softmax_cpu(self, device, dtype):
