@@ -131,12 +131,9 @@ Tensor masked_softmax(
 
     // Post-process: replace NaN with zeros for fully masked rows
     // This matches _safe_softmax behavior and prevents NaN propagation
+    // Note: We do this unconditionally to avoid device-to-host synchronization
     auto has_nan = result.isnan();
-    if (has_nan.any().item<bool>()) {
-      result = result.masked_fill(has_nan, 0.0);
-    }
-
-    return result;
+    return result.masked_fill(has_nan, 0.0);
   } else {
     // Use _safe_softmax to handle rows with all -inf (produces 0 instead of NaN)
     return at::native::_safe_softmax(attn_scores, attn_scores.dim() - 1, std::nullopt);
