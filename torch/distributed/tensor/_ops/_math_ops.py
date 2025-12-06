@@ -635,17 +635,55 @@ def foreach_max_strategy(op_schema: OpSchema) -> TupleStrategy:
 
 
 @register_op_strategy(
+    [aten.triu.default, aten.tril.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def triu_tril_strategy(op_schema: OpSchema) -> OpStrategy:
+    """
+    Strategy for triu/tril that preserves sharding on matrix dimensions.
+
+    These ops can be computed locally by adjusting the diagonal offset k
+    based on the shard position: adjusted_k = k + row_offset - col_offset.
+
+    The actual offset adjustment happens in ShardingPropagator via the
+    op_to_diagonal_idx mechanism in _sharding_prop.py.
+    """
+    args_schema = op_schema.args_schema
+    input_strategy = args_schema[0]
+    if not isinstance(input_strategy, OpStrategy):
+        raise AssertionError(f"Expected OpStrategy, got {type(input_strategy)}")
+
+    output_strategies: list[OpSpec] = []
+    for placement_strategy in input_strategy.strategies:
+        input_spec = placement_strategy.output_spec
+        # triu/tril preserves shape and placement; the diagonal offset
+        # is adjusted in _sharding_prop.py via op_to_diagonal_idx
+        output_spec = DTensorSpec(
+            mesh=input_spec.mesh,
+            placements=input_spec.placements,
+            tensor_meta=input_spec.tensor_meta,
+        )
+        redistribute_cost = [generate_redistribute_costs(input_strategy, input_spec)]
+        output_strategies.append(
+            OpSpec(
+                output_specs=output_spec,
+                input_specs=(input_spec,),
+                redistribute_cost=redistribute_cost,
+            )
+        )
+    return OpStrategy(output_strategies)
+
+
+@register_op_strategy(
     [
         aten._linalg_svd.default,
         aten.linalg_qr.default,
-        # TODO: The diagonal ops can have an improved sharding strategy for
-        # shard placements that does not require redistributing to replicate.
-        aten.diagonal_copy.default,
-        aten.diag_embed.default,
-        aten.diag.default,
+        # TODO: diagonal extraction could avoid O(n^2) all-gather by computing
+        # locally with adjusted offset then all-gathering the O(n) diagonal.
         aten.diagonal.default,
-        aten.tril.default,
-        aten.triu.default,
+        aten.diagonal_copy.default,
+        aten.diag.default,
+        aten.diag_embed.default,
         aten._linalg_eigh.default,
         aten.upsample_bicubic2d.default,
         aten.upsample_bilinear2d.default,

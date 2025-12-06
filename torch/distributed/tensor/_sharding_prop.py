@@ -346,6 +346,12 @@ class ShardingPropagator:
             aten.select_backward.default: 1,
             aten.slice_backward.default: 1,
         }
+        # op map for diagonal offset adjustment (triu/tril)
+        # Maps op to the index of the diagonal argument
+        self.op_to_diagonal_idx: dict[OpOverload, int] = {
+            aten.triu.default: 1,
+            aten.tril.default: 1,
+        }
 
     def register_sharding_prop_rule(
         self,
@@ -764,6 +770,21 @@ class ShardingPropagator:
                         needs_redistribute = True
                         use_val_from_redistribute_schema = True
 
+                # diagonal offset needs to be adjusted for triu/tril
+                if op_schema.op in self.op_to_diagonal_idx:
+                    assert isinstance(output_strategy.output_spec, DTensorSpec)
+                    if output_strategy.output_spec.is_sharded():
+                        schema = suggestion_schema or op_schema
+                        input_spec = expected_input_specs[0]
+                        assert isinstance(input_spec, DTensorSpec)
+                        adjusted = self._adjust_diagonal_arg(
+                            schema, input_spec
+                        )
+                        if adjusted is not None:
+                            suggestion_schema = adjusted
+                            needs_redistribute = True
+                            use_val_from_redistribute_schema = True
+
                 # construct output spec for the op
                 if op_schema.return_type_tuple_tensor_like():
                     # for ops that return multiple tensors and the output_specs is not
@@ -950,3 +971,66 @@ class ShardingPropagator:
             )
 
         return OpSchema(schema.op, tuple(expected_input_schema), schema.kwargs_schema)
+
+    def _adjust_diagonal_arg(
+        self,
+        schema: OpSchema,
+        input_spec: DTensorSpec,
+    ) -> OpSchema | None:
+        """Adjust diagonal offset k for triu/tril on sharded tensors.
+
+        adjusted_k = k + row_offset - col_offset
+
+        This works for any matrix shape and offset because triu/tril
+        preserves the tensor shape (no output size change).
+
+        Returns None if no adjustment is needed.
+        """
+        from torch.distributed.tensor.placement_types import Shard
+
+        diagonal_idx = self.op_to_diagonal_idx[schema.op]
+        placements = input_spec.placements
+        assert input_spec.tensor_meta is not None
+        global_shape = input_spec.tensor_meta.shape
+        ndim = len(global_shape)
+
+        if ndim < 2:
+            return None
+
+        # Check if sharded on matrix dims (last 2 dims).
+        # Exact type match excludes _StridedShard, which represents
+        # interleaved FSDP2+TP sharding where the local data isn't a
+        # contiguous block of rows/columns — the offset formula doesn't apply.
+        is_sharded_on_matrix = False
+        for placement in placements:
+            if type(placement) is Shard:
+                dim = placement.dim
+                if dim < 0:
+                    dim = ndim + dim
+                if dim == ndim - 2 or dim == ndim - 1:
+                    is_sharded_on_matrix = True
+                    break
+
+        if not is_sharded_on_matrix:
+            return None
+
+        _, global_offset = compute_local_shape_and_global_offset(
+            global_shape, input_spec.mesh, placements
+        )
+        row_offset = int(global_offset[-2])
+        col_offset = int(global_offset[-1])
+
+        if row_offset == 0 and col_offset == 0:
+            return None
+
+        # Adjust diagonal: adjusted_k = k + row_offset - col_offset
+        args = list(schema.args_schema)
+        original_k = cast(int, args[diagonal_idx]) if len(args) > diagonal_idx else 0
+        adjusted_k = original_k + row_offset - col_offset
+
+        # Pad args if the diagonal arg wasn't explicitly provided
+        while len(args) <= diagonal_idx:
+            args.append(0)
+        args[diagonal_idx] = adjusted_k
+
+        return OpSchema(schema.op, tuple(args), schema.kwargs_schema)

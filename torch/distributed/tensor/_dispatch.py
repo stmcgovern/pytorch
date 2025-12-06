@@ -588,6 +588,14 @@ class OpDispatcher:
                 else:
                     new_local_args.append(arg_spec)
 
+        # Handle extra args from redistribute_schema when they were added
+        # (e.g., diagonal offset adjustment for triu/tril adds k when not present)
+        if use_val_from_redistribute_schema:
+            original_len = len(op_info.flat_args_schema)
+            schema_len = len(flatten_args_schema_to_reshard)
+            for i in range(original_len, schema_len):
+                new_local_args.append(flatten_args_schema_to_reshard[i])
+
         op_info.local_args = tuple(new_local_args)
 
     def unwrap_to_op_info(
