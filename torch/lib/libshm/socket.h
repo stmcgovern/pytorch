@@ -34,9 +34,22 @@ class Socket {
   }
 
   struct sockaddr_un prepare_address(const char* path) {
-    struct sockaddr_un address;
+    struct sockaddr_un address = {};
     address.sun_family = AF_UNIX;
-    strcpy(address.sun_path, path);
+
+    // Validate path length to prevent buffer overflow.
+    // sun_path is char[108] on Linux, char[104] on macOS; max strlen is one less.
+    size_t path_len = strlen(path);
+    constexpr size_t max_path_len = sizeof(address.sun_path) - 1;
+    if (path_len > max_path_len) {
+      throw std::runtime_error(
+          "Unix socket path too long (" + std::to_string(path_len) +
+          " bytes, max " + std::to_string(max_path_len) +
+          "). Set TMPDIR to a shorter path (e.g., export TMPDIR=/tmp)");
+    }
+
+    std::memcpy(address.sun_path, path, path_len);
+    address.sun_path[path_len] = '\0';
     return address;
   }
 

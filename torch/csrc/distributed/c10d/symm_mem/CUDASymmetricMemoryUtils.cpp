@@ -1,7 +1,9 @@
+#include <cstring>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <c10/util/Exception.h>
 #include <c10/util/error.h>
 
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
@@ -15,6 +17,25 @@
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
 
 namespace c10d::symmetric_memory {
+
+namespace {
+
+// Helper to safely copy socket path into sockaddr_un, preventing buffer overflow.
+// sun_path is char[108] on Linux, char[104] on macOS; max strlen is one less.
+void set_unix_socket_path(sockaddr_un& addr, const std::string& path) {
+  constexpr size_t max_path_len = sizeof(addr.sun_path) - 1;
+  TORCH_CHECK(
+      path.size() <= max_path_len,
+      "Unix socket path too long (",
+      path.size(),
+      " bytes, max ",
+      max_path_len,
+      "). Set TMPDIR to a shorter path (e.g., export TMPDIR=/tmp)");
+  std::memcpy(addr.sun_path, path.c_str(), path.size());
+  addr.sun_path[path.size()] = '\0';
+}
+
+} // namespace
 
 bool device_has_multicast_support(int device_idx) {
   if (c10::utils::check_env("TORCH_SYMM_MEM_DISABLE_MULTICAST") == true) {
@@ -58,7 +79,7 @@ IpcChannel::IpcChannel()
       socket_ != -1, "Failed to create socket: ", c10::utils::str_error(errno));
 
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
-  std::copy(socket_name_.begin(), socket_name_.end(), addr.sun_path);
+  set_unix_socket_path(addr, socket_name_);
 
   TORCH_CHECK(
       bind(socket_, (struct sockaddr*)&addr, SUN_LEN(&addr)) == 0,
@@ -78,7 +99,7 @@ void IpcChannel::send_fd(int dst_pid, int fd) {
   // Define destination socket address
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
   auto socket_name = get_socket_name(dst_pid);
-  std::copy(socket_name.begin(), socket_name.end(), addr.sun_path);
+  set_unix_socket_path(addr, socket_name);
 
   // Prepare data to send
   // Data being sent is "fd", the value of fd will be sent as auxiliary data
@@ -143,7 +164,7 @@ int IpcChannel::recv_fd() {
   // Define socket address to receive on: family AF_UNIX means unix domain
   // socket
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
-  std::copy(socket_name_.begin(), socket_name_.end(), addr.sun_path);
+  set_unix_socket_path(addr, socket_name_);
 
   // Prepare message header
   struct msghdr msg = {
