@@ -321,8 +321,6 @@ dtensor_compiled_fails = {
     xfail("nn.functional.binary_cross_entropy_with_logits"),
     xfail("nn.functional.gaussian_nll_loss"),
     xfail("nn.functional.logsigmoid"),
-    # batch norm: Dynamo fake prop expand mismatch with sharded running stats
-    xfail("_batch_norm_with_update"),
     # Miscellaneous runtime crashes (e.g. index out of bounds).
     xfail("gather"),
     xfail("index_select"),
@@ -337,6 +335,10 @@ dtensor_compiled_fails = {
 # Ops that compile successfully but fail numeric checks in eager DTensor tests.
 # These are excluded from TestCompiledDTensorOps skip list since we don't check numerics.
 dtensor_numeric_only_fails = {
+    # batch norm: local statistics differ when batch dim is sharded (DDP semantics)
+    xfail("_native_batch_norm_legit"),
+    xfail("native_batch_norm"),
+    xfail("nn.functional.batch_norm"),
     xfail("arange"),
     xfail("broadcast_shapes"),
     xfail("eye"),

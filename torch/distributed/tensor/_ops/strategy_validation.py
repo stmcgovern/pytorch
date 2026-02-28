@@ -49,8 +49,8 @@ from torch.testing._internal.opinfo import core as opinfo_core
 from torch.utils import _pytree as pytree
 
 
-# A combo key is (input_placement_strs, output_placement_str)
-ComboKey = tuple[tuple[str, ...], str]
+# A combo key is (input_placement_strs, output_placement_strs)
+ComboKey = tuple[tuple[str, ...], tuple[str, ...]]
 
 # Partial reduce ops to enumerate
 PARTIAL_REDUCE_OPS = ["sum", "avg", "min", "max"]
@@ -74,11 +74,14 @@ class PlacementCombination:
     """Represents a combination of input and output placements."""
 
     input_placements: tuple[Placement, ...]  # One placement per input tensor
-    output_placement: Placement  # Placement for the output tensor
+    output_placements: tuple[Placement, ...]  # One placement per output tensor
 
     def __hash__(self):
         return hash(
-            (tuple(str(p) for p in self.input_placements), str(self.output_placement))
+            (
+                tuple(str(p) for p in self.input_placements),
+                tuple(str(p) for p in self.output_placements),
+            )
         )
 
     def __eq__(self, other):
@@ -86,10 +89,12 @@ class PlacementCombination:
             return NotImplemented
         return tuple(str(p) for p in self.input_placements) == tuple(
             str(p) for p in other.input_placements
-        ) and str(self.output_placement) == str(other.output_placement)
+        ) and tuple(str(p) for p in self.output_placements) == tuple(
+            str(p) for p in other.output_placements
+        )
 
     def __str__(self):
-        return f"inputs={placement_tuple_to_str(self.input_placements)}, output={placement_tuple_to_str((self.output_placement,))}"
+        return f"inputs={placement_tuple_to_str(self.input_placements)}, outputs={placement_tuple_to_str(self.output_placements)}"
 
 
 @dataclass
@@ -97,7 +102,7 @@ class Discrepancy:
     """Represents a discrepancy between ground truth and DTensor's rules."""
 
     input_placements: tuple[str, ...]
-    output_placement: str
+    output_placements: tuple[str, ...]
     sample_idx: int
     input_shapes: tuple[tuple[int, ...], ...]
     discrepancy_type: str  # "false_positive" or "false_negative"
@@ -223,7 +228,7 @@ def normalize_placement_str(p_str: str, shape: tuple[int, ...]) -> str:
 def normalize_combo_key(
     combo_key: ComboKey,
     input_shapes: tuple[tuple[int, ...], ...],
-    output_shape: tuple[int, ...],
+    output_shapes: tuple[tuple[int, ...], ...],
 ) -> ComboKey:
     """
     Normalize a combo_key by converting trivial shards to Replicate.
@@ -233,25 +238,26 @@ def normalize_combo_key(
     - S(0), R -> R on input [1,4] becomes R, R -> R
 
     Args:
-        combo_key: (input_placement_strs, output_placement_str) tuple
+        combo_key: (input_placement_strs, output_placement_strs) tuple
         input_shapes: Shapes of input tensors
-        output_shape: Shape of output tensor
+        output_shapes: Shapes of output tensors
 
     Returns:
         Normalized combo_key with trivial shards converted to Replicate
     """
-    input_placement_strs, output_placement_str = combo_key
+    input_placement_strs, output_placement_strs = combo_key
 
-    # Normalize input placements
     normalized_inputs = tuple(
         normalize_placement_str(p_str, shape)
         for p_str, shape in zip(input_placement_strs, input_shapes)
     )
 
-    # Normalize output placement
-    normalized_output = normalize_placement_str(output_placement_str, output_shape)
+    normalized_outputs = tuple(
+        normalize_placement_str(p_str, shape)
+        for p_str, shape in zip(output_placement_strs, output_shapes)
+    )
 
-    return (normalized_inputs, normalized_output)
+    return (normalized_inputs, normalized_outputs)
 
 
 def get_1d_input_placements_for_tensor(
@@ -439,10 +445,11 @@ def validate_combination(
         op: The operator function
         sample_input: The SampleInput with original arguments
         tensors: List of (name, tensor) pairs extracted from sample
-        combination: The placement combination to validate
+        combination: The placement combination to validate. output_placements
+            has one placement per output tensor.
         ground_truth: Expected output tensor(s). For multi-output ops, a list
-            of tensors where each element is validated independently against
-            the same output placement.
+            of tensors where each element is validated against its
+            corresponding output placement.
         world_size: Number of simulated ranks
         mesh: Optional pre-created device mesh (for performance)
 
@@ -526,15 +533,17 @@ def validate_combination(
             if not isinstance(local_out, LocalTensor):
                 return False, f"LocalTensor inputs produced non-LocalTensor output[{i}]"
 
+            out_plc = combination.output_placements[i]
+
             output_dt = DTensor.from_local(
                 local_out,
                 mesh,
-                (combination.output_placement,),
+                (out_plc,),
                 shape=gt.shape,
                 stride=gt.stride(),
             )
 
-            if isinstance(combination.output_placement, Replicate):
+            if isinstance(out_plc, Replicate):
                 local_values = [local_out._local_tensors[r] for r in range(world_size)]
                 all_same = all(
                     torch.allclose(local_values[0], lv, atol=1e-5, rtol=1e-5)
@@ -575,29 +584,30 @@ def validate_combination(
 
 
 def has_pmin_pmax(
-    input_placements: tuple[Placement, ...], output_placement: Placement
+    input_placements: tuple[Placement, ...],
+    output_placements: tuple[Placement, ...],
 ) -> bool:
     """Check if any placement is Partial(min) or Partial(max)."""
     for p in input_placements:
         if isinstance(p, Partial) and p.reduce_op in ("min", "max"):
             return True
-    if isinstance(output_placement, Partial) and output_placement.reduce_op in (
-        "min",
-        "max",
-    ):
-        return True
+    for p in output_placements:
+        if isinstance(p, Partial) and p.reduce_op in ("min", "max"):
+            return True
     return False
 
 
 def has_any_partial(
-    input_placements: tuple[Placement, ...], output_placement: Placement
+    input_placements: tuple[Placement, ...],
+    output_placements: tuple[Placement, ...],
 ) -> bool:
     """Check if any placement is Partial (any reduce op)."""
     for p in input_placements:
         if isinstance(p, Partial):
             return True
-    if isinstance(output_placement, Partial):
-        return True
+    for p in output_placements:
+        if isinstance(p, Partial):
+            return True
     return False
 
 
@@ -633,7 +643,7 @@ def _run_op_on_sample(op: Callable[..., Any], sample: SampleInput) -> Any:
 def _extract_rules_from_op_strategy(
     op_strategy: Any,
     input_shapes: tuple[tuple[int, ...], ...],
-    output_shape: tuple[int, ...],
+    output_shapes: tuple[tuple[int, ...], ...],
 ) -> set[ComboKey]:
     """Extract normalized sharding rules from an OpStrategy.
 
@@ -649,22 +659,23 @@ def _extract_rules_from_op_strategy(
         if spec.input_specs is None:
             continue
         if isinstance(spec.output_specs, tuple):
-            first_output_spec = spec.output_specs[0]
-            # output_specs tuple can contain None for non-tensor outputs
-            # (e.g. SDPA's philox_seed/offset, layer norm backward with
-            # output_mask). The validator doesn't support mixed outputs.
-            if first_output_spec is None:
-                raise NotImplementedError(
-                    f"Strategy has None in output_specs, indicating mixed "
-                    f"tensor/non-tensor outputs which the validator does not "
-                    f"support. output_specs: {spec.output_specs}"
-                )
-            output_plc = first_output_spec.placements[0]
+            output_plcs: list[Placement] = []
+            for out_spec in spec.output_specs:
+                if out_spec is None:
+                    raise NotImplementedError(
+                        f"Strategy has None in output_specs, indicating mixed "
+                        f"tensor/non-tensor outputs which the validator does not "
+                        f"support. output_specs: {spec.output_specs}"
+                    )
+                output_plcs.append(out_spec.placements[0])
         else:
-            output_plc = spec.output_spec.placements[0]
+            output_plcs = [spec.output_spec.placements[0]]
         input_plcs = tuple(s.placements[0] for s in spec.input_specs)
-        rule_key = (tuple(str(p) for p in input_plcs), str(output_plc))
-        normalized_rule = normalize_combo_key(rule_key, input_shapes, output_shape)
+        rule_key: ComboKey = (
+            tuple(str(p) for p in input_plcs),
+            tuple(str(p) for p in output_plcs),
+        )
+        normalized_rule = normalize_combo_key(rule_key, input_shapes, output_shapes)
         if not is_fully_replicated(
             tuple(parse_placement(p) or Replicate() for p in normalized_rule[0])
         ):
@@ -733,10 +744,15 @@ def query_single_dim_strategy(
     tensors: list[tuple[str, torch.Tensor]],
     mesh: DeviceMesh | None,
     kwargs: dict[str, Any] | None = None,
+    scalar_args: tuple[Any, ...] = (),
 ) -> list[list[Placement]] | None:
     """
     Query DTensor's single-dim strategy for given input tensors.
-    Returns list of [output_placement, *input_placements] rules.
+    Returns list of [*output_placements, *input_placements] rules.
+
+    scalar_args are positional non-tensor args (in schema order, with tensors
+    removed). They are interleaved with tensor metas to reconstruct the full
+    args_meta tuple that the strategy function expects.
     """
     propagator = DTensor._op_dispatcher.sharding_propagator
 
@@ -745,9 +761,30 @@ def query_single_dim_strategy(
 
     strategy_func = propagator.op_single_dim_strategy_funcs[op_overload]
 
-    args_meta = tuple(
+    tensor_metas = [
         TensorMeta(shape=t.shape, stride=t.stride(), dtype=t.dtype) for _, t in tensors
-    )
+    ]
+
+    # Reconstruct full args_meta in schema order by interleaving tensor metas
+    # with scalar args. This matches what OpSchema.args_meta does in the real
+    # dispatch path.
+    if scalar_args:
+        args_meta_list: list[Any] = []
+        tensor_idx = 0
+        scalar_idx = 0
+        for schema_arg in op_overload._schema.arguments:
+            arg_type = str(schema_arg.type)
+            if "Tensor" in arg_type:
+                if tensor_idx < len(tensor_metas):
+                    args_meta_list.append(tensor_metas[tensor_idx])
+                    tensor_idx += 1
+            else:
+                if scalar_idx < len(scalar_args):
+                    args_meta_list.append(scalar_args[scalar_idx])
+                    scalar_idx += 1
+        args_meta = tuple(args_meta_list)
+    else:
+        args_meta = tuple(tensor_metas)
 
     try:
         result = strategy_func(op_overload, args_meta, kwargs or {})
@@ -932,7 +969,7 @@ def _query_dtensor_rules(
     non_tensor_args: tuple[Any, ...],
     non_tensor_kwargs: dict[str, Any],
     input_shapes: tuple[tuple[int, ...], ...],
-    output_shape: tuple[int, ...],
+    output_shapes: tuple[tuple[int, ...], ...],
     world_size: int,
     verbose: bool,
 ) -> set[ComboKey]:
@@ -951,27 +988,31 @@ def _query_dtensor_rules(
 
     if aten_op in propagator.op_single_dim_strategy_funcs:
         strategy_result = query_single_dim_strategy(
-            aten_op, tensors, None, kwargs=non_tensor_kwargs
+            aten_op, tensors, None, kwargs=non_tensor_kwargs,
+            scalar_args=non_tensor_args,
         )
         if strategy_result:
+            num_inputs = len(tensors)
             for combo in strategy_result:
-                if len(combo) >= len(tensors) + 1:
-                    output_plc = combo[0]
-                    input_plcs = tuple(combo[1 : len(tensors) + 1])
-                    rule_key = (
-                        tuple(str(p) for p in input_plcs),
-                        str(output_plc),
+                num_outputs = len(combo) - num_inputs
+                if num_outputs < 1:
+                    continue
+                output_plcs = tuple(combo[:num_outputs])
+                input_plcs = tuple(combo[num_outputs : num_outputs + num_inputs])
+                rule_key: ComboKey = (
+                    tuple(str(p) for p in input_plcs),
+                    tuple(str(p) for p in output_plcs),
+                )
+                normalized_rule = normalize_combo_key(
+                    rule_key, input_shapes, output_shapes
+                )
+                if not is_fully_replicated(
+                    tuple(
+                        parse_placement(p) or Replicate()
+                        for p in normalized_rule[0]
                     )
-                    normalized_rule = normalize_combo_key(
-                        rule_key, input_shapes, output_shape
-                    )
-                    if not is_fully_replicated(
-                        tuple(
-                            parse_placement(p) or Replicate()
-                            for p in normalized_rule[0]
-                        )
-                    ):
-                        rules.add(normalized_rule)
+                ):
+                    rules.add(normalized_rule)
 
     elif aten_op in propagator.op_strategy_funcs:
         try:
@@ -997,7 +1038,7 @@ def _query_dtensor_rules(
             strategy_func = propagator.op_strategy_funcs[aten_op]
             output_strategy = strategy_func(op_schema)
             rules |= _extract_rules_from_op_strategy(
-                output_strategy, input_shapes, output_shape
+                output_strategy, input_shapes, output_shapes
             )
         except Exception as e:
             if verbose:
@@ -1038,7 +1079,7 @@ def _query_dtensor_rules(
                 )
                 if output_strategy is not None:
                     rules |= _extract_rules_from_op_strategy(
-                        output_strategy, input_shapes, output_shape
+                        output_strategy, input_shapes, output_shapes
                     )
             except Exception as e:
                 if verbose:
@@ -1052,14 +1093,14 @@ def _validate_with_mitigations(
     sample: SampleInput,
     tensors: list[tuple[str, torch.Tensor]],
     input_placements: tuple[Placement, ...],
-    output_placement: Placement,
+    output_placements: tuple[Placement, ...],
     ground_truth: torch.Tensor | list[torch.Tensor],
     world_size: int,
     mesh: DeviceMesh,
     mitigations: _FalsePositiveMitigations,
 ) -> bool:
     """Validate a combination, including false positive mitigation re-checks."""
-    combo = PlacementCombination(input_placements, output_placement)
+    combo = PlacementCombination(input_placements, output_placements)
     is_valid, _ = validate_combination(
         op, sample, tensors, combo, ground_truth, world_size, mesh
     )
@@ -1067,11 +1108,11 @@ def _validate_with_mitigations(
     if (
         is_valid
         and mitigations.negated_sample
-        and has_pmin_pmax(input_placements, output_placement)
+        and has_pmin_pmax(input_placements, output_placements)
     ):
         assert mitigations.negated_tensors is not None
         assert mitigations.negated_ground_truth is not None
-        negated_combo = PlacementCombination(input_placements, output_placement)
+        negated_combo = PlacementCombination(input_placements, output_placements)
         negated_valid, _ = validate_combination(
             op,
             mitigations.negated_sample,
@@ -1086,10 +1127,10 @@ def _validate_with_mitigations(
     if (
         is_valid
         and mitigations.non_rounded_sample
-        and has_any_partial(input_placements, output_placement)
+        and has_any_partial(input_placements, output_placements)
     ):
         assert mitigations.non_rounded_ground_truth is not None
-        non_rounded_combo = PlacementCombination(input_placements, output_placement)
+        non_rounded_combo = PlacementCombination(input_placements, output_placements)
         non_rounded_valid, _ = validate_combination(
             op,
             mitigations.non_rounded_sample,
@@ -1104,11 +1145,11 @@ def _validate_with_mitigations(
     if (
         is_valid
         and mitigations.non_rounded_negated_sample
-        and has_pmin_pmax(input_placements, output_placement)
+        and has_pmin_pmax(input_placements, output_placements)
     ):
         assert mitigations.non_rounded_negated_tensors is not None
         assert mitigations.non_rounded_negated_ground_truth is not None
-        nr_negated_combo = PlacementCombination(input_placements, output_placement)
+        nr_negated_combo = PlacementCombination(input_placements, output_placements)
         nr_negated_valid, _ = validate_combination(
             op,
             mitigations.non_rounded_negated_sample,
@@ -1126,11 +1167,11 @@ def _validate_with_mitigations(
 def _assert_keys_normalized(
     keys: set[ComboKey],
     input_shapes: tuple[tuple[int, ...], ...],
-    output_shape: tuple[int, ...],
+    output_shapes: tuple[tuple[int, ...], ...],
 ) -> None:
     """Assert all combo keys have trivial shards already normalized to Replicate."""
     for key in keys:
-        assert key == normalize_combo_key(key, input_shapes, output_shape), (
+        assert key == normalize_combo_key(key, input_shapes, output_shapes), (
             f"Key {key} contains un-normalized trivial shards; "
             f"call normalize_combo_key before _compare_rules"
         )
@@ -1140,7 +1181,7 @@ def _compare_rules(
     ground_truth_valid: set[ComboKey],
     dtensor_rules: set[ComboKey],
     input_shapes: tuple[tuple[int, ...], ...],
-    output_shape: tuple[int, ...],
+    output_shapes: tuple[tuple[int, ...], ...],
     sample_idx: int,
     scalar_args: tuple[Any, ...],
     scalar_kwargs: dict[str, Any],
@@ -1153,8 +1194,8 @@ def _compare_rules(
     if not dtensor_rules:
         return
 
-    _assert_keys_normalized(ground_truth_valid, input_shapes, output_shape)
-    _assert_keys_normalized(dtensor_rules, input_shapes, output_shape)
+    _assert_keys_normalized(ground_truth_valid, input_shapes, output_shapes)
+    _assert_keys_normalized(dtensor_rules, input_shapes, output_shapes)
 
     for combo_key in ground_truth_valid:
         if combo_key in dtensor_rules:
@@ -1163,7 +1204,7 @@ def _compare_rules(
             stats.false_negatives.append(
                 Discrepancy(
                     input_placements=combo_key[0],
-                    output_placement=combo_key[1],
+                    output_placements=combo_key[1],
                     sample_idx=sample_idx,
                     input_shapes=input_shapes,
                     discrepancy_type="false_negative",
@@ -1180,7 +1221,7 @@ def _compare_rules(
             stats.false_positives.append(
                 Discrepancy(
                     input_placements=combo_key[0],
-                    output_placement=combo_key[1],
+                    output_placements=combo_key[1],
                     sample_idx=sample_idx,
                     input_shapes=input_shapes,
                     discrepancy_type="false_positive",
@@ -1238,14 +1279,15 @@ def _print_discrepancy_section(
     )
     for d in discrepancies:
         op_str = str(d.aten_op) if d.aten_op else "(unknown)"
-        key = (d.input_placements, d.output_placement)
+        key = (d.input_placements, d.output_placements)
         by_op[op_str][key].append(d)
 
     for op_str in sorted(by_op.keys()):
         print(f"\n  [{op_str}]")
         for (inp, out), discs in sorted(by_op[op_str].items(), key=str):
             inp_str = ", ".join(inp)
-            print(f"    {inp_str} -> {out}")
+            out_str = ", ".join(out) if len(out) > 1 else out[0]
+            print(f"    {inp_str} -> {out_str}")
             if show_repro:
                 limit = len(discs) if show_repro < 0 else show_repro
                 for d in discs[:limit]:
@@ -1367,7 +1409,10 @@ def compare_operator(
                 continue
 
             input_shapes = tuple(t.shape for _, t in tensors)
-            output_shape = tuple(first_gt.shape)
+            ground_truth_list = (
+                ground_truth if isinstance(ground_truth, list) else [ground_truth]
+            )
+            output_shapes = tuple(tuple(gt.shape) for gt in ground_truth_list)
 
             scalar_args = tuple(
                 a for a in sample.args if not isinstance(a, torch.Tensor)
@@ -1384,10 +1429,12 @@ def compare_operator(
                 get_1d_input_placements_for_tensor(t, include_partial=True)
                 for _, t in tensors
             ]
-            output_placement_options = get_1d_output_placements_for_tensor(first_gt)
+            per_output_placement_options = [
+                get_1d_output_placements_for_tensor(gt) for gt in ground_truth_list
+            ]
 
             aten_op, non_tensor_args, non_tensor_kwargs = get_aten_op_for_sample(
-                op, sample, opinfo.name
+                op, sample, opinfo.aten_name or opinfo.name
             )
 
             dtensor_rules = _query_dtensor_rules(
@@ -1396,7 +1443,7 @@ def compare_operator(
                 non_tensor_args,
                 non_tensor_kwargs,
                 input_shapes,
-                output_shape,
+                output_shapes,
                 world_size,
                 verbose,
             )
@@ -1408,9 +1455,11 @@ def compare_operator(
                 mesh = init_device_mesh(tensor_device, (world_size,))
 
                 if incorrect_only:
-                    combinations_to_test = []
+                    combinations_to_test: list[
+                        tuple[tuple[Placement, ...], tuple[Placement, ...], ComboKey]
+                    ] = []
                     for combo_key in dtensor_rules:
-                        input_plc_strs, output_plc_str = combo_key
+                        input_plc_strs, output_plc_strs = combo_key
                         input_plcs_list: list[Placement] = []
                         all_valid = True
                         for s in input_plc_strs:
@@ -1419,29 +1468,41 @@ def compare_operator(
                                 all_valid = False
                                 break
                             input_plcs_list.append(p)
-                        output_plc = parse_placement(output_plc_str)
-                        if not all_valid or output_plc is None:
+                        output_plcs_list: list[Placement] = []
+                        for s in output_plc_strs:
+                            p = parse_placement(s)
+                            if p is None:
+                                all_valid = False
+                                break
+                            output_plcs_list.append(p)
+                        if not all_valid:
                             continue
                         combinations_to_test.append(
-                            (tuple(input_plcs_list), output_plc, combo_key)
+                            (
+                                tuple(input_plcs_list),
+                                tuple(output_plcs_list),
+                                combo_key,
+                            )
                         )
                 else:
                     combinations_to_test = []
                     for input_placements in itertools.product(*input_placement_options):
                         if is_fully_replicated(input_placements):
                             continue
-                        for output_placement in output_placement_options:
+                        for output_placements in itertools.product(
+                            *per_output_placement_options
+                        ):
                             combo_key = (
                                 tuple(str(p) for p in input_placements),
-                                str(output_placement),
+                                tuple(str(p) for p in output_placements),
                             )
                             combinations_to_test.append(
-                                (input_placements, output_placement, combo_key)
+                                (input_placements, output_placements, combo_key)
                             )
 
                 for (
                     input_placements,
-                    output_placement,
+                    output_placements,
                     combo_key,
                 ) in combinations_to_test:
                     total_combinations += 1
@@ -1450,7 +1511,7 @@ def compare_operator(
                         sample,
                         tensors,
                         input_placements,
-                        output_placement,
+                        output_placements,
                         ground_truth,
                         world_size,
                         mesh,
@@ -1459,7 +1520,7 @@ def compare_operator(
 
                     if is_valid:
                         normalized_key = normalize_combo_key(
-                            combo_key, input_shapes, output_shape
+                            combo_key, input_shapes, output_shapes
                         )
                         if not is_fully_replicated(
                             tuple(
@@ -1473,7 +1534,7 @@ def compare_operator(
                 ground_truth_valid,
                 dtensor_rules,
                 input_shapes,
-                output_shape,
+                output_shapes,
                 sample_idx,
                 scalar_args,
                 scalar_kwargs,
@@ -1695,11 +1756,11 @@ if __name__ == "__main__":
 
             for name, stats, elapsed in formatted_results:
                 fp_rules = {
-                    (d.input_placements, d.output_placement)
+                    (d.input_placements, d.output_placements)
                     for d in stats.false_positives
                 }
                 fn_rules = {
-                    (d.input_placements, d.output_placement)
+                    (d.input_placements, d.output_placements)
                     for d in stats.false_negatives
                 }
                 n_fp = len(fp_rules)
