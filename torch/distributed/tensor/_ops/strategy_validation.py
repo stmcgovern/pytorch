@@ -756,9 +756,13 @@ def get_aten_op_for_sample(
         captured_op = capture.best_match
         captured_args = capture.best_match_args
         captured_kwargs = capture.best_match_kwargs
-    elif capture.all_ops:
+    elif len(capture.all_ops) == 1:
+        # Only one aten op was called — safe to use it even without name match
         captured_op, captured_args, captured_kwargs = capture.all_ops[0]
     else:
+        # Multiple aten ops but none matched the target name — the op
+        # decomposed through unrelated intermediaries. Skip rather than
+        # testing irrelevant rules against wrong ground truth.
         return AtenOpInfo()
 
     non_tensor_args = tuple(a for a in captured_args if not isinstance(a, torch.Tensor))
