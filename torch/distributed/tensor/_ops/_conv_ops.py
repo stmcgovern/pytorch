@@ -135,12 +135,6 @@ def convolution_backward_rules(op_schema: OpSchema) -> OutputSharding:
 def _batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
     """Sharding propagation for native_batch_norm forward variants.
 
-    Supports batch-dim sharding (each rank normalizes its local batch — same
-    semantics as non-synchronized batch norm in data parallelism) and
-    channel-dim sharding (each rank processes independent channels).
-
-    Args schema: input, weight?, bias?, running_mean?, running_var?,
-                 training, momentum, eps
     Returns: (output, save_mean, save_invstd)
     """
     input_spec = op_schema.args_schema[0]
@@ -148,9 +142,10 @@ def _batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
     assert input_spec.tensor_meta is not None
 
     in_shape = input_spec.tensor_meta.shape
-    output_stride = _compute_contiguous_stride(in_shape)
+    assert len(in_shape) >= 2, f"batch norm requires >= 2D input, got {len(in_shape)}D"
 
     # output has same shape and sharding as input
+    output_stride = _compute_contiguous_stride(in_shape)
     output_meta = TensorMeta(
         torch.Size(in_shape), output_stride, input_spec.tensor_meta.dtype
     )
@@ -162,14 +157,13 @@ def _batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
     )
 
     # save_mean/save_invstd have shape (C,) — follow the channel dim sharding
-    n_channels = in_shape[1] if len(in_shape) > 1 else 0
-    channel_mesh_dim = input_spec.dim_map[1] if len(input_spec.dim_map) > 1 else -1
+    n_channels = in_shape[1]
     stats_meta = TensorMeta(
         torch.Size([n_channels]), (1,), input_spec.tensor_meta.dtype
     )
     stats_spec = DTensorSpec.from_dim_map(
         input_spec.mesh,
-        [channel_mesh_dim],
+        [input_spec.dim_map[1]],
         [],
         tensor_meta=stats_meta,
     )
@@ -178,54 +172,39 @@ def _batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
 
 
 @register_prop_rule(aten._batch_norm_with_update.default)
-def batch_norm_with_update_rules(op_schema: OpSchema) -> OutputSharding:
-    """Sharding propagation for _batch_norm_with_update.
-
-    Args schema: input, weight?, bias?, running_mean, running_var,
-                 momentum, eps
-    Returns: (output, save_mean, save_rstd, reserve)
+@register_prop_rule(aten._batch_norm_no_update.default)
+def batch_norm_with_reserve_rules(op_schema: OpSchema) -> OutputSharding:
+    """_batch_norm_with_update and _batch_norm_no_update return 4 outputs:
+    (output, save_mean, save_rstd, reserve). The reserve tensor is an opaque
+    empty buffer used by cuDNN — always replicated.
     """
+    input_spec = op_schema.args_schema[0]
+    assert isinstance(input_spec, DTensorSpec)
+
     fwd = _batch_norm_fwd_rules(op_schema)
     assert isinstance(fwd.output_spec, list)
     output_spec, stats_spec, _ = fwd.output_spec
 
-    # reserve is an empty (0,) uint8 tensor — always replicated
     reserve_meta = TensorMeta(torch.Size([0]), (1,), torch.uint8)
     reserve_spec = DTensorSpec.from_dim_map(
-        op_schema.args_schema[0].mesh,  # type: ignore[union-attr]
-        [-1],
-        [],
-        tensor_meta=reserve_meta,
+        input_spec.mesh, [-1], [], tensor_meta=reserve_meta
     )
 
     return OutputSharding([output_spec, stats_spec, stats_spec, reserve_spec])
 
 
 @register_prop_rule(aten.native_batch_norm.default)
-def native_batch_norm_rules(op_schema: OpSchema) -> OutputSharding:
-    return _batch_norm_fwd_rules(op_schema)
-
-
 @register_prop_rule(aten._native_batch_norm_legit.default)
-def native_batch_norm_legit_rules(op_schema: OpSchema) -> OutputSharding:
-    return _batch_norm_fwd_rules(op_schema)
-
-
 @register_prop_rule(aten._native_batch_norm_legit.no_stats)
-def native_batch_norm_legit_no_stats_rules(op_schema: OpSchema) -> OutputSharding:
+def batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
     return _batch_norm_fwd_rules(op_schema)
 
 
 @register_prop_rule(aten.native_batch_norm_backward.default)
 def native_batch_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
-    """Sharding propagation for native_batch_norm_backward.
-
-    Args schema: grad_out, input, weight?, running_mean?, running_var?,
-                 save_mean?, save_invstd?, train, eps, output_mask
-    Returns: (grad_input, grad_weight, grad_bias)
-    """
+    """Returns: (grad_input, grad_weight, grad_bias)"""
     (
-        grad_out_spec,
+        _grad_out_spec,
         input_spec,
         weight_spec,
         _running_mean_spec,
@@ -237,14 +216,12 @@ def native_batch_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
         _output_mask,
     ) = op_schema.args_schema
 
-    assert isinstance(grad_out_spec, DTensorSpec)
     assert isinstance(input_spec, DTensorSpec)
     assert input_spec.tensor_meta is not None
 
-    # grad_input: same shape/sharding as input
     grad_input_spec = input_spec
 
-    # grad_weight/grad_bias: shape (C,), need reduction across sharded dims
+    # grad_weight/grad_bias: shape (C,), partial sum across batch/spatial dims
     n_channels = input_spec.tensor_meta.shape[1]
     param_meta = TensorMeta(
         torch.Size([n_channels]), (1,), input_spec.tensor_meta.dtype
@@ -252,20 +229,13 @@ def native_batch_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
 
     if weight_spec is not None:
         grad_weight_spec = DTensorSpec.from_dim_map(
-            input_spec.mesh,
-            [-1],
-            [0],
-            tensor_meta=param_meta,
+            input_spec.mesh, [-1], [0], tensor_meta=param_meta
         )
     else:
         grad_weight_spec = None
 
-    # grad_bias always produced (even if bias was None, PyTorch still returns it)
     grad_bias_spec = DTensorSpec.from_dim_map(
-        input_spec.mesh,
-        [-1],
-        [0],
-        tensor_meta=param_meta,
+        input_spec.mesh, [-1], [0], tensor_meta=param_meta
     )
 
     return OutputSharding([grad_input_spec, grad_weight_spec, grad_bias_spec])
