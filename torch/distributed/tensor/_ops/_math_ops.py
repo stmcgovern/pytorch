@@ -324,10 +324,8 @@ LINEAR_REDUCTION_OP_MAP = {
     aten.mean.dim: "avg",
     aten.mean.out: "avg",
     aten.max.default: "max",
-    aten.max.dim: "max",
     aten.max.out: "max",
     aten.min.default: "min",
-    aten.min.dim: "min",
     aten.min.out: "min",
     aten.amax.default: "max",
     aten.amax.out: "max",
@@ -335,11 +333,14 @@ LINEAR_REDUCTION_OP_MAP = {
     aten.amin.out: "min",
 }
 
-# argmax/argmin return indices which cannot be combined with P(max/min).
-# They need special handling that forces redistribution on reduction dims.
-ARGMAX_ARGMIN_OPS = {
+# Ops that return indices which cannot be combined with P(max/min).
+# Local indices are positions within each shard and can't be reduced with
+# max/min to produce global indices. Force redistribution on reduction dims.
+INDEX_RETURNING_REDUCTION_OPS = {
     aten.argmax.default: "max",
     aten.argmin.default: "min",
+    aten.max.dim: "max",
+    aten.min.dim: "min",
 }
 
 
@@ -369,13 +370,14 @@ def linear_reduction_strategy(op_schema: OpSchema) -> OpStrategy:
     )
 
 
-@register_op_strategy(list(ARGMAX_ARGMIN_OPS.keys()), schema_info=RuntimeSchemaInfo(1))
-def argmax_argmin_strategy(op_schema: OpSchema) -> OpStrategy:
+@register_op_strategy(
+    list(INDEX_RETURNING_REDUCTION_OPS.keys()), schema_info=RuntimeSchemaInfo(1)
+)
+def index_returning_reduction_strategy(op_schema: OpSchema) -> OpStrategy:
     """
-    Strategy for argmax/argmin. These return indices, not values, so they cannot
-    use P(max/min) output placements. The indices are local to each shard and
-    cannot be meaningfully combined across ranks with a max/min reduction.
-    Force redistribution on reduction dimensions by using reduction_linear=False.
+    Strategy for reductions that return indices (argmax, argmin, max.dim, min.dim).
+    Local indices are positions within each shard and cannot be combined with
+    P(max/min) across ranks. Force redistribution on reduction dimensions.
     """
     args_schema = op_schema.args_schema
     input_strategy = args_schema[0]
@@ -388,16 +390,12 @@ def argmax_argmin_strategy(op_schema: OpSchema) -> OpStrategy:
 
     reduce_dims = list(range(input_strategy.ndim)) if dims is None else dims
     keep_dim = len(op_schema.args_schema) > 2 and bool(op_schema.args_schema[2])
-    reduction_op = ARGMAX_ARGMIN_OPS[op_schema.op]
+    reduction_op = INDEX_RETURNING_REDUCTION_OPS[op_schema.op]
     return common_reduction_strategy(
         input_strategy,
         reduce_dims,
         keep_dim=keep_dim,
-        reduction_linear=False,  # Force redistribution - indices can't use P(max/min)
-        # reduction_op is effectively unused here: reduction_linear=False
-        # forces all reduction-dim Shard placements to Replicate before
-        # map_placements_after_reduction, so no Shard-on-reduction-dim
-        # remains to convert to Partial. Passed for consistency.
+        reduction_linear=False,
         reduction_op=reduction_op,
     )
 
