@@ -2,9 +2,15 @@
 # implement convolution and batch norm ops for distributed tensor
 
 import torch
+from torch._ops import OpOverload
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
-from torch.distributed.tensor._op_schema import OpSchema, OutputSharding
+from torch.distributed.tensor._op_schema import ArgsType, KwargsType, OpSchema, OutputSharding
+from torch.distributed.tensor._ops.single_dim_strategy import (
+    _ShardingPlaceholder,
+    register_single_dim_strategy,
+)
 from torch.distributed.tensor._ops.utils import register_prop_rule
+from torch.distributed.tensor.placement_types import Placement, Replicate
 
 
 aten = torch.ops.aten
@@ -123,78 +129,105 @@ def convolution_backward_rules(op_schema: OpSchema) -> OutputSharding:
     else:
         grad_bias_spec = None
 
-    # TODO: actually the output_mask is not respected here, we should
-    # set the corresponding spec to `None` if the output_mask is not `False`
-    # for a certain output Tensor. This also applies to the conv handler
-    # in torch/distributed/tensor/_tp_conv.py
+    # TODO: output_mask is not respected here — we should set the
+    # corresponding spec to None when output_mask is False.
     return OutputSharding([grad_input_spec, grad_weight_spec, grad_bias_spec])
 
 
-def _batch_norm_fwd_specs(
-    op_schema: OpSchema,
-) -> tuple[DTensorSpec, DTensorSpec]:
-    """Compute output and stats specs for batch norm forward.
+# --------------------------------------------------------------------------- #
+# Batch norm: single-dim strategies
+# --------------------------------------------------------------------------- #
 
-    Returns (output_spec, stats_spec) where stats_spec is used for both
-    save_mean and save_invstd (same shape and placement).
+
+def _get_bn_training(op: OpOverload, args_schema: ArgsType) -> bool:
+    """Extract training mode from batch norm args."""
+    if op == aten._batch_norm_with_update.default:
+        return True
+    if op == aten._batch_norm_no_update.default:
+        return False
+    for i, schema_arg in enumerate(op._schema.arguments):
+        if schema_arg.name in ("training", "train"):
+            return args_schema[i]  # type: ignore[return-value]
+    return True
+
+
+def _bn_fwd_strategies(
+    training: bool,
+    ndim: int,
+    num_outputs: int,
+    num_tensor_inputs: int,
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """Generate batch norm forward strategies for a single mesh dim.
+
+    Batch norm tensors fall into two categories:
+      - ndim-D: input and output (share the same sharding)
+      - 1D: weight, bias, running_mean, running_var, save_mean, save_invstd
+
+    Channel-dim sharding (dim 1 on ndim-D, dim 0 on 1D) is always valid since
+    per-channel statistics are independent. In inference mode, BN is a per-channel
+    pointwise op so any dim works. In training mode, batch and spatial dim sharding
+    compute local statistics (DDP semantics for batch dim; wrong for spatial dims).
     """
-    input_spec = op_schema.args_schema[0]
-    assert isinstance(input_spec, DTensorSpec)
-    assert input_spec.tensor_meta is not None
+    num_param_inputs = num_tensor_inputs - 1
+    has_reserve = num_outputs == 4
+    # stats outputs: save_mean, save_invstd (exclude reserve if present)
+    num_stats_outputs = num_outputs - 1 - int(has_reserve)
 
-    in_shape = input_spec.tensor_meta.shape
-    assert len(in_shape) >= 2, f"batch norm requires >= 2D input, got {len(in_shape)}D"
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
 
-    # output has same shape and sharding as input
-    output_stride = _compute_contiguous_stride(in_shape)
-    output_meta = TensorMeta(
-        torch.Size(in_shape), output_stride, input_spec.tensor_meta.dtype
-    )
-    output_spec = DTensorSpec.from_dim_map(
-        input_spec.mesh,
-        input_spec.dim_map,
-        input_spec.sums,
-        tensor_meta=output_meta,
-    )
+    # Channel-dim sharding: always valid
+    ch: list[Placement | _ShardingPlaceholder] = [_ShardingPlaceholder(1)]
+    ch.extend([_ShardingPlaceholder(0)] * num_stats_outputs)
+    if has_reserve:
+        ch.append(Replicate())
+    ch.append(_ShardingPlaceholder(1))
+    ch.extend([_ShardingPlaceholder(0)] * num_param_inputs)
+    strategies.append(ch)
 
-    # save_mean/save_invstd have shape (C,) — follow the channel dim sharding
-    n_channels = in_shape[1]
-    stats_meta = TensorMeta(
-        torch.Size([n_channels]), (1,), input_spec.tensor_meta.dtype
-    )
-    stats_spec = DTensorSpec.from_dim_map(
-        input_spec.mesh,
-        [input_spec.dim_map[1]],
-        [],
-        tensor_meta=stats_meta,
-    )
+    if not training:
+        # Inference: BN is pointwise with running stats, all dims valid
+        for d in range(ndim):
+            if d == 1:
+                continue
+            s: list[Placement | _ShardingPlaceholder] = [_ShardingPlaceholder(d)]
+            s.extend([Replicate()] * num_stats_outputs)
+            if has_reserve:
+                s.append(Replicate())
+            s.append(_ShardingPlaceholder(d))
+            s.extend([Replicate()] * num_param_inputs)
+            strategies.append(s)
+    else:
+        # Training: batch-dim sharding (DDP semantics — local statistics)
+        b: list[Placement | _ShardingPlaceholder] = [_ShardingPlaceholder(0)]
+        b.extend([Replicate()] * num_stats_outputs)
+        if has_reserve:
+            b.append(Replicate())
+        b.append(_ShardingPlaceholder(0))
+        b.extend([Replicate()] * num_param_inputs)
+        strategies.append(b)
 
-    return output_spec, stats_spec
-
-
-@register_prop_rule(aten._batch_norm_with_update.default)
-@register_prop_rule(aten._batch_norm_no_update.default)
-def batch_norm_with_reserve_rules(op_schema: OpSchema) -> OutputSharding:
-    """_batch_norm_with_update and _batch_norm_no_update return 4 outputs:
-    (output, save_mean, save_rstd, reserve). The reserve tensor is an opaque
-    empty buffer used by cuDNN — always replicated.
-    """
-    output_spec, stats_spec = _batch_norm_fwd_specs(op_schema)
-
-    reserve_meta = TensorMeta(torch.Size([0]), (1,), torch.uint8)
-    reserve_spec = DTensorSpec.from_dim_map(
-        output_spec.mesh, [-1], [], tensor_meta=reserve_meta
-    )
-
-    return OutputSharding([output_spec, stats_spec, stats_spec, reserve_spec])
+    return strategies
 
 
-@register_prop_rule(aten.native_batch_norm.default)
-@register_prop_rule(aten._native_batch_norm_legit.default)
-@register_prop_rule(aten._native_batch_norm_legit.no_stats)
-def batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
-    output_spec, stats_spec = _batch_norm_fwd_specs(op_schema)
-    return OutputSharding([output_spec, stats_spec, stats_spec])
+@register_single_dim_strategy(
+    [
+        aten.native_batch_norm.default,
+        aten._native_batch_norm_legit.default,
+        aten._native_batch_norm_legit.no_stats,
+        aten._batch_norm_with_update.default,
+        aten._batch_norm_no_update.default,
+    ],
+)
+def batch_norm_fwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    assert isinstance(input_meta, TensorMeta)
+    ndim = len(input_meta.shape)
+    training = _get_bn_training(op, args_schema)
+    num_outputs = len(op._schema.returns)
+    num_tensor_inputs = sum(1 for a in args_schema if isinstance(a, TensorMeta))
+    return _bn_fwd_strategies(training, ndim, num_outputs, num_tensor_inputs)
 
 
 @register_prop_rule(aten.native_batch_norm_backward.default)
