@@ -707,11 +707,24 @@ class _CaptureAtenOp(torch.utils._python_dispatch.TorchDispatchMode):
         return func(*args, **kwargs)
 
 
+@dataclass
+class AtenOpInfo:
+    """Captured aten op and its arguments from a torch-level op call."""
+
+    op: OpOverload | None = None
+    full_args: tuple[Any, ...] = ()
+    full_kwargs: dict[str, Any] = field(default_factory=dict)
+    non_tensor_args: tuple[Any, ...] = ()
+    non_tensor_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
 def get_aten_op_for_sample(
     op: Callable[..., Any], sample: SampleInput, op_name: str = ""
-) -> tuple[OpOverload | None, tuple[Any, ...], dict[str, Any]]:
+) -> AtenOpInfo:
     """
     Determine the actual aten op that will be dispatched for a given sample.
+    Returns full captured args (for re-running the aten op) plus non-tensor
+    extractions (for strategy queries).
     """
     with _CaptureAtenOp(op_name) as capture:
         try:
@@ -729,14 +742,20 @@ def get_aten_op_for_sample(
     elif capture.all_ops:
         captured_op, captured_args, captured_kwargs = capture.all_ops[0]
     else:
-        return None, (), {}
+        return AtenOpInfo()
 
     non_tensor_args = tuple(a for a in captured_args if not isinstance(a, torch.Tensor))
     non_tensor_kwargs = {
         k: v for k, v in captured_kwargs.items() if not isinstance(v, torch.Tensor)
     }
 
-    return captured_op, non_tensor_args, non_tensor_kwargs
+    return AtenOpInfo(
+        op=captured_op,
+        full_args=tuple(captured_args),
+        full_kwargs=dict(captured_kwargs),
+        non_tensor_args=non_tensor_args,
+        non_tensor_kwargs=non_tensor_kwargs,
+    )
 
 
 def query_single_dim_strategy(
@@ -1433,15 +1452,61 @@ def compare_operator(
                 get_1d_output_placements_for_tensor(gt) for gt in ground_truth_list
             ]
 
-            aten_op, non_tensor_args, non_tensor_kwargs = get_aten_op_for_sample(
+            aten_info = get_aten_op_for_sample(
                 op, sample, opinfo.aten_name or opinfo.name
             )
 
+            # The op and sample used for validation. Defaults to the torch-level
+            # op, but upgraded to the aten op when it produces more outputs.
+            validate_op: Callable[..., Any] = op
+            validate_sample = sample
+            validate_tensors = tensors
+
+            # If the aten op produces more outputs than the torch-level op,
+            # re-run the aten op to get full ground truth for all outputs.
+            # E.g., nn.functional.batch_norm returns 1 tensor but
+            # aten.native_batch_norm returns (output, save_mean, save_invstd).
+            if aten_info.op is not None and aten_info.full_args:
+                try:
+                    aten_result = aten_info.op(
+                        *aten_info.full_args, **aten_info.full_kwargs
+                    )
+                    if isinstance(aten_result, (list, tuple)):
+                        aten_outputs = [
+                            t for t in aten_result if isinstance(t, torch.Tensor)
+                        ]
+                        if len(aten_outputs) > len(ground_truth_list):
+                            ground_truth_list = aten_outputs
+                            ground_truth = aten_outputs
+                            output_shapes = tuple(
+                                tuple(gt.shape) for gt in ground_truth_list
+                            )
+                            per_output_placement_options = [
+                                get_1d_output_placements_for_tensor(gt)
+                                for gt in ground_truth_list
+                            ]
+                            # Switch validation to use the aten op so local
+                            # outputs also produce all outputs.
+                            validate_op = aten_info.op
+                            validate_sample = SampleInput(
+                                aten_info.full_args[0],
+                                args=tuple(aten_info.full_args[1:]),
+                                kwargs=aten_info.full_kwargs,
+                            )
+                            validate_tensors = extract_tensors_from_sample(
+                                validate_sample
+                            )
+                            mitigations = _prepare_false_positive_mitigations(
+                                validate_op, validate_sample, validate_tensors
+                            )
+                except Exception:
+                    pass
+
             dtensor_rules = _query_dtensor_rules(
-                aten_op,
+                aten_info.op,
                 tensors,
-                non_tensor_args,
-                non_tensor_kwargs,
+                aten_info.non_tensor_args,
+                aten_info.non_tensor_kwargs,
                 input_shapes,
                 output_shapes,
                 world_size,
@@ -1507,9 +1572,9 @@ def compare_operator(
                 ) in combinations_to_test:
                     total_combinations += 1
                     is_valid = _validate_with_mitigations(
-                        op,
-                        sample,
-                        tensors,
+                        validate_op,
+                        validate_sample,
+                        validate_tensors,
                         input_placements,
                         output_placements,
                         ground_truth,
@@ -1538,7 +1603,7 @@ def compare_operator(
                 sample_idx,
                 scalar_args,
                 scalar_kwargs,
-                aten_op,
+                aten_info.op,
                 variant,
                 stats,
                 sample,
