@@ -181,6 +181,18 @@ def parse_placement(s: str) -> Placement | None:
         m = re.match(r"P\((\w+)\)", s)
         if m:
             return Partial(m.group(1))
+    elif s.startswith("_NormP("):
+        m = re.match(r"_NormP\(([^)]+)\)", s)
+        if m:
+            from torch.distributed.tensor._ops._math_ops import _NormPartial
+
+            try:
+                norm_type = float(m.group(1))
+                if norm_type == int(norm_type):
+                    norm_type = int(norm_type)
+                return _NormPartial(norm_type=norm_type)
+            except ValueError:
+                pass
     return None
 
 
@@ -669,7 +681,12 @@ def _extract_rules_from_op_strategy(
                     )
                 output_plcs.append(out_spec.placements[0])
         else:
-            output_plcs = [spec.output_spec.placements[0]]
+            # Single output spec — but the op may return multiple tensors.
+            # DTensor's ShardingPropagator replicates the single spec for each
+            # return value (see _sharding_prop.py:765-775). Mirror that here.
+            single_plc = spec.output_spec.placements[0]
+            num_outputs = len(output_shapes) if output_shapes else 1
+            output_plcs = [single_plc] * num_outputs
         input_plcs = tuple(s.placements[0] for s in spec.input_specs)
         rule_key: ComboKey = (
             tuple(str(p) for p in input_plcs),
