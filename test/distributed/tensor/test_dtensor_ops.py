@@ -198,6 +198,10 @@ dtensor_fails = {
     xfail("nn.functional.conv_transpose1d"),
     xfail("nn.functional.conv_transpose2d"),
     xfail("nn.functional.conv_transpose3d"),
+    # batch norm: local statistics differ when batch dim is sharded
+    xfail("_native_batch_norm_legit"),
+    xfail("native_batch_norm"),
+    xfail("nn.functional.batch_norm"),
     # in-place op requires placement change during decomposition
     xfail("nn.functional.cosine_similarity"),
     # Shard(0) causes local tensor index out of bounds for value broadcasting
@@ -317,6 +321,8 @@ dtensor_compiled_fails = {
     xfail("nn.functional.binary_cross_entropy_with_logits"),
     xfail("nn.functional.gaussian_nll_loss"),
     xfail("nn.functional.logsigmoid"),
+    # batch norm: Dynamo fake prop expand mismatch with sharded running stats
+    xfail("_batch_norm_with_update"),
     # Miscellaneous runtime crashes (e.g. index out of bounds).
     xfail("gather"),
     xfail("index_select"),
@@ -368,9 +374,7 @@ dtensor_numeric_only_fails = {
 # Ops in dtensor_fails that have no sharding strategy (NotImplementedError).
 # These will error during sharding propagation and affect unbacked tests too.
 dtensor_fails_no_strategy = {
-    xfail("_batch_norm_with_update"),
     xfail("_chunk_cat"),
-    xfail("_native_batch_norm_legit"),
     xfail("_unsafe_masked_index"),
     xfail("_unsafe_masked_index_put_accumulate"),
     xfail("_upsample_bilinear2d_aa"),
@@ -468,7 +472,6 @@ dtensor_fails_no_strategy = {
     xfail("nanmedian"),
     xfail("nanquantile"),
     xfail("nansum"),
-    xfail("native_batch_norm"),
     xfail("nn.functional.adaptive_avg_pool1d"),
     xfail("nn.functional.adaptive_avg_pool2d"),
     xfail("nn.functional.adaptive_avg_pool3d"),
@@ -478,7 +481,6 @@ dtensor_fails_no_strategy = {
     xfail("nn.functional.avg_pool1d"),
     xfail("nn.functional.avg_pool2d"),
     xfail("nn.functional.avg_pool3d"),
-    xfail("nn.functional.batch_norm"),
     xfail("nn.functional.bilinear"),
     xfail("nn.functional.grid_sample"),
     xfail("nn.functional.group_norm"),
@@ -883,6 +885,8 @@ class TestLocalDTensorOps(TestDTensorOps):
 # Ops where DTensor shard prop has DDEs with unbacked (base tensor passes).
 # This list only contains ops NOT in ops_dde_xfail - those are base tensor issues.
 ops_unbacked_dtensor_dde = {
+    xfail("_batch_norm_with_update"),
+    xfail("_native_batch_norm_legit"),
     xfail("__getitem__"),
     xfail("__radd__"),
     xfail("__rdiv__"),
@@ -975,6 +979,7 @@ ops_unbacked_dtensor_dde = {
     xfail("mv"),
     xfail("narrow"),
     xfail("narrow_copy"),
+    xfail("native_batch_norm"),
     xfail("ne"),
     xfail("new_empty"),
     xfail("new_empty_strided"),
@@ -982,6 +987,7 @@ ops_unbacked_dtensor_dde = {
     xfail("new_ones"),
     xfail("new_zeros"),
     xfail("nextafter"),
+    xfail("nn.functional.batch_norm"),
     xfail("nn.functional.celu"),
     xfail("nn.functional.conv1d"),
     xfail("nn.functional.conv2d"),
