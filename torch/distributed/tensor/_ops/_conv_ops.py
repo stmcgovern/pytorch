@@ -72,9 +72,8 @@ def convolution_rules(op_schema: OpSchema) -> OutputSharding:
 
 @register_prop_rule(aten.convolution_backward.default)
 def convolution_backward_rules(op_schema: OpSchema) -> OutputSharding:
-    input_spec = op_schema.args_schema[0]
     (
-        grad_output_spec,
+        _grad_output_spec,
         input_spec,
         weight_spec,
         bias_shape_opt,
@@ -87,7 +86,6 @@ def convolution_backward_rules(op_schema: OpSchema) -> OutputSharding:
         _output_mask,
     ) = op_schema.args_schema
 
-    assert isinstance(grad_output_spec, DTensorSpec)
     assert isinstance(input_spec, DTensorSpec)
     assert isinstance(weight_spec, DTensorSpec)
     # bias_shape_opt can be None (optional parameter in aten.convolution_backward schema)
@@ -132,10 +130,13 @@ def convolution_backward_rules(op_schema: OpSchema) -> OutputSharding:
     return OutputSharding([grad_input_spec, grad_weight_spec, grad_bias_spec])
 
 
-def _batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
-    """Sharding propagation for native_batch_norm forward variants.
+def _batch_norm_fwd_specs(
+    op_schema: OpSchema,
+) -> tuple[DTensorSpec, DTensorSpec]:
+    """Compute output and stats specs for batch norm forward.
 
-    Returns: (output, save_mean, save_invstd)
+    Returns (output_spec, stats_spec) where stats_spec is used for both
+    save_mean and save_invstd (same shape and placement).
     """
     input_spec = op_schema.args_schema[0]
     assert isinstance(input_spec, DTensorSpec)
@@ -168,7 +169,7 @@ def _batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
         tensor_meta=stats_meta,
     )
 
-    return OutputSharding([output_spec, stats_spec, stats_spec])
+    return output_spec, stats_spec
 
 
 @register_prop_rule(aten._batch_norm_with_update.default)
@@ -178,16 +179,11 @@ def batch_norm_with_reserve_rules(op_schema: OpSchema) -> OutputSharding:
     (output, save_mean, save_rstd, reserve). The reserve tensor is an opaque
     empty buffer used by cuDNN — always replicated.
     """
-    input_spec = op_schema.args_schema[0]
-    assert isinstance(input_spec, DTensorSpec)
-
-    fwd = _batch_norm_fwd_rules(op_schema)
-    assert isinstance(fwd.output_spec, list)
-    output_spec, stats_spec, _ = fwd.output_spec
+    output_spec, stats_spec = _batch_norm_fwd_specs(op_schema)
 
     reserve_meta = TensorMeta(torch.Size([0]), (1,), torch.uint8)
     reserve_spec = DTensorSpec.from_dim_map(
-        input_spec.mesh, [-1], [], tensor_meta=reserve_meta
+        output_spec.mesh, [-1], [], tensor_meta=reserve_meta
     )
 
     return OutputSharding([output_spec, stats_spec, stats_spec, reserve_spec])
@@ -197,7 +193,8 @@ def batch_norm_with_reserve_rules(op_schema: OpSchema) -> OutputSharding:
 @register_prop_rule(aten._native_batch_norm_legit.default)
 @register_prop_rule(aten._native_batch_norm_legit.no_stats)
 def batch_norm_fwd_rules(op_schema: OpSchema) -> OutputSharding:
-    return _batch_norm_fwd_rules(op_schema)
+    output_spec, stats_spec = _batch_norm_fwd_specs(op_schema)
+    return OutputSharding([output_spec, stats_spec, stats_spec])
 
 
 @register_prop_rule(aten.native_batch_norm_backward.default)
