@@ -377,8 +377,8 @@ def native_group_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
     (
         grad_out_spec,
         input_spec,
-        _mean_spec,
-        _rstd_spec,
+        _mean_spec,  # saved from forward; placement always matches input
+        _rstd_spec,  # saved from forward; placement always matches input
         weight_spec,
         _N,
         _C,

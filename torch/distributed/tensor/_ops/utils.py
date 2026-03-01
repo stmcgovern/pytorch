@@ -62,6 +62,10 @@ def _get_registration_wrapper(
 
 
 # convenient wrapper to register sharding propagation rules
+# When skip_decomp=True, the prop rule takes priority over auto-derived
+# decomposition strategies. Use this when the op has semantics that the
+# decomp path can't handle, e.g. explicit scalar args (like N in GroupNorm)
+# that must be adjusted to the local shard size.
 def register_prop_rule(
     op: torch._ops.OpOverload | list[torch._ops.OpOverload],
     schema_info: RuntimeSchemaInfo | None = None,
