@@ -198,10 +198,6 @@ dtensor_fails = {
     xfail("nn.functional.conv_transpose1d"),
     xfail("nn.functional.conv_transpose2d"),
     xfail("nn.functional.conv_transpose3d"),
-    # batch norm: local statistics differ when batch dim is sharded
-    xfail("_native_batch_norm_legit"),
-    xfail("native_batch_norm"),
-    xfail("nn.functional.batch_norm"),
     # in-place op requires placement change during decomposition
     xfail("nn.functional.cosine_similarity"),
     # Shard(0) causes local tensor index out of bounds for value broadcasting
@@ -341,10 +337,6 @@ dtensor_compiled_fails = {
 # Ops that compile successfully but fail numeric checks in eager DTensor tests.
 # These are excluded from TestCompiledDTensorOps skip list since we don't check numerics.
 dtensor_numeric_only_fails = {
-    # batch norm: local statistics differ when batch dim is sharded (DDP semantics)
-    xfail("_native_batch_norm_legit"),
-    xfail("native_batch_norm"),
-    xfail("nn.functional.batch_norm"),
     xfail("arange"),
     # eigenvector sign ambiguity with batch-dim sharding
     xfail("linalg.eigh"),

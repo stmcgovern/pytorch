@@ -12,128 +12,42 @@ from torch.distributed.tensor._ops.single_dim_strategy import (
 )
 from torch.distributed.tensor._ops.utils import register_prop_rule
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
-from torch.distributed.tensor.placement_types import Placement, Replicate
+from torch.distributed.tensor.placement_types import Partial, Placement, Replicate
 
 
 aten = torch.ops.aten
 
 
-def _compute_contiguous_stride(shape: list[int] | torch.Size) -> tuple[int, ...]:
-    stride = [1]
-    for i in range(1, len(shape)):
-        stride.insert(0, stride[0] * shape[-i])
-    return tuple(stride)
-
-
-@register_prop_rule(aten.convolution.default)
-def convolution_rules(op_schema: OpSchema) -> OutputSharding:
-    (
-        input_spec,
-        weight_spec,
-        bias_spec,
-        stride,
-        padding,
-        dilation,
-        _transposed,
-        _output_padding,
-        _groups,
-    ) = op_schema.args_schema
-
-    assert isinstance(input_spec, DTensorSpec)
-    assert isinstance(weight_spec, DTensorSpec)
-    # bias_spec can be None (optional parameter in aten.convolution schema)
-    if bias_spec is not None:
-        assert isinstance(bias_spec, DTensorSpec)
-    assert input_spec.tensor_meta is not None
-    assert weight_spec.tensor_meta is not None
-    in_shape = input_spec.tensor_meta.shape
-    weight_shape = weight_spec.tensor_meta.shape
-    assert isinstance(stride, list), f"stride must be list, got {type(stride)}"
-    assert isinstance(padding, list), f"padding must be list, got {type(padding)}"
-    assert isinstance(dilation, list), f"dilation must be list, got {type(dilation)}"
-    # weight_shape might not be torch.Size in all cases (e.g., SymIntArrayRef during tracing)
-    # so we don't assert its type, just use it
-    out_conv_shape = [
-        (d + 2 * padding[i] - dilation[i] * (weight_shape[i + 1] - 1) - 1) // stride[i]
-        + 1
-        for (i, d) in enumerate(in_shape[2:])
+@register_single_dim_strategy([aten.convolution.default])
+def conv_fwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # Spatial-dim sharding is incorrect for kernel_size > 1 (kernel straddles
+    # shard boundaries), so only batch-dim sharding is valid.
+    num_tensor_inputs = sum(1 for a in args_schema if isinstance(a, TensorMeta))
+    num_param_inputs = num_tensor_inputs - 1  # weight + optional bias
+    s: list[Placement | _ShardingPlaceholder] = [
+        _ShardingPlaceholder(0),  # output: batch-dim sharded
+        _ShardingPlaceholder(0),  # input: batch-dim sharded
     ]
-    output_shape = [in_shape[0], weight_shape[0]] + out_conv_shape
-    output_stride = _compute_contiguous_stride(output_shape)
-    output_dim_map = input_spec.dim_map
-    pending_sums = input_spec.sums
-
-    tensor_meta = TensorMeta(
-        torch.Size(output_shape),
-        tuple(output_stride),
-        input_spec.tensor_meta.dtype,
-    )
-    return OutputSharding(
-        DTensorSpec.from_dim_map(
-            input_spec.mesh,
-            output_dim_map,
-            pending_sums,
-            tensor_meta=tensor_meta,
-        )
-    )
+    s.extend([Replicate()] * num_param_inputs)
+    return [s]
 
 
-@register_prop_rule(aten.convolution_backward.default)
-def convolution_backward_rules(op_schema: OpSchema) -> OutputSharding:
-    (
-        _grad_output_spec,
-        input_spec,
-        weight_spec,
-        bias_shape_opt,
-        _stride,
-        _padding,
-        _dilation,
-        _transposed,
-        _output_padding,
-        _groups,
-        _output_mask,
-    ) = op_schema.args_schema
-
-    assert isinstance(input_spec, DTensorSpec)
-    assert isinstance(weight_spec, DTensorSpec)
-    # bias_shape_opt can be None (optional parameter in aten.convolution_backward schema)
-    if bias_shape_opt is not None:
-        assert isinstance(bias_shape_opt, list)
-    assert input_spec.tensor_meta is not None
-    weight_tensor_meta = weight_spec.tensor_meta
-
-    # Only create bias_tensor_meta if bias_shape_opt is not None
-    if bias_shape_opt is not None:
-        bias_tensor_meta = TensorMeta(
-            torch.Size(bias_shape_opt),
-            (1,),
-            input_spec.tensor_meta.dtype,
-        )
-    else:
-        bias_tensor_meta = None
-
-    grad_input_spec = input_spec
-    grad_weight_spec = DTensorSpec.from_dim_map(
-        input_spec.mesh,
-        [-1, -1, -1, -1],
-        [0],
-        tensor_meta=weight_tensor_meta,
-    )
-
-    # Only create grad_bias_spec if we have bias_tensor_meta
-    if bias_tensor_meta is not None:
-        grad_bias_spec = DTensorSpec.from_dim_map(
-            input_spec.mesh,
-            [-1],
-            [0],
-            tensor_meta=bias_tensor_meta,
-        )
-    else:
-        grad_bias_spec = None
-
-    # TODO: output_mask is not respected here — we should set the
-    # corresponding spec to None when output_mask is False.
-    return OutputSharding([grad_input_spec, grad_weight_spec, grad_bias_spec])
+@register_single_dim_strategy([aten.convolution_backward.default])
+def conv_bwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # 3 outputs: grad_input, grad_weight, grad_bias
+    # 3 inputs: grad_output, input, weight (bias_sizes is SymInt[]?, not a tensor)
+    return [[
+        _ShardingPlaceholder(0),  # grad_input: batch-dim sharded
+        Partial(),                # grad_weight: reduction over batch
+        Partial(),                # grad_bias: reduction over batch
+        _ShardingPlaceholder(0),  # grad_output
+        _ShardingPlaceholder(0),  # input
+        Replicate(),              # weight
+    ]]
 
 
 # --------------------------------------------------------------------------- #
@@ -167,8 +81,8 @@ def _bn_fwd_strategies(
 
     Channel-dim sharding (dim 1 on ndim-D, dim 0 on 1D) is always valid since
     per-channel statistics are independent. In inference mode, BN is a per-channel
-    pointwise op so any dim works. In training mode, batch and spatial dim sharding
-    compute local statistics (DDP semantics for batch dim; wrong for spatial dims).
+    pointwise op so any dim works. Training mode only supports channel-dim sharding
+    because batch-dim sharding computes local statistics that differ from global.
     """
     num_param_inputs = num_tensor_inputs - 1
     has_reserve = num_outputs == 4
@@ -198,15 +112,6 @@ def _bn_fwd_strategies(
             s.append(_ShardingPlaceholder(d))
             s.extend([Replicate()] * num_param_inputs)
             strategies.append(s)
-    else:
-        # Training: batch-dim sharding (DDP semantics — local statistics)
-        b: list[Placement | _ShardingPlaceholder] = [_ShardingPlaceholder(0)]
-        b.extend([Replicate()] * num_stats_outputs)
-        if has_reserve:
-            b.append(Replicate())
-        b.append(_ShardingPlaceholder(0))
-        b.extend([Replicate()] * num_param_inputs)
-        strategies.append(b)
 
     return strategies
 
@@ -232,51 +137,50 @@ def batch_norm_fwd_single_dim_strategy(
     return _bn_fwd_strategies(training, ndim, num_outputs, num_tensor_inputs)
 
 
-@register_prop_rule(aten.native_batch_norm_backward.default)
-def native_batch_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
-    """Returns: (grad_input, grad_weight, grad_bias)"""
-    (
-        _grad_out_spec,
-        input_spec,
-        weight_spec,
-        _running_mean_spec,
-        _running_var_spec,
-        _save_mean_spec,
-        _save_invstd_spec,
-        _train,
-        _eps,
-        _output_mask,
-    ) = op_schema.args_schema
+@register_single_dim_strategy([aten.native_batch_norm_backward.default])
+def batch_norm_bwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """3 outputs: grad_input, grad_weight, grad_bias.
+    Tensor inputs: grad_out, input, and optional 1D params (weight, running_mean/var, save_mean/invstd).
+    """
+    num_tensor_inputs = sum(1 for a in args_schema if isinstance(a, TensorMeta))
+    num_param_inputs = num_tensor_inputs - 2  # exclude grad_out and input
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
 
-    assert isinstance(input_spec, DTensorSpec)
-    assert input_spec.tensor_meta is not None
+    # Channel-dim sharding: per-channel statistics are independent
+    ch: list[Placement | _ShardingPlaceholder] = [
+        _ShardingPlaceholder(1),  # grad_input
+        _ShardingPlaceholder(0),  # grad_weight (1D, channel dim = 0)
+        _ShardingPlaceholder(0),  # grad_bias (1D, channel dim = 0)
+        _ShardingPlaceholder(1),  # grad_out
+        _ShardingPlaceholder(1),  # input
+    ]
+    ch.extend([_ShardingPlaceholder(0)] * num_param_inputs)
+    strategies.append(ch)
 
-    grad_input_spec = input_spec
+    # Batch-dim sharding: param grads are Partial (reduction over batch).
+    # Forward training BN only offers channel-dim, but the backward still
+    # needs this for redistributed inputs or inference-mode backward.
+    b: list[Placement | _ShardingPlaceholder] = [
+        _ShardingPlaceholder(0),  # grad_input
+        Partial(),                # grad_weight: reduction over batch
+        Partial(),                # grad_bias: reduction over batch
+        _ShardingPlaceholder(0),  # grad_out
+        _ShardingPlaceholder(0),  # input
+    ]
+    b.extend([Replicate()] * num_param_inputs)
+    strategies.append(b)
 
-    # grad_weight/grad_bias: shape (C,), partial sum across batch/spatial dims
-    n_channels = input_spec.tensor_meta.shape[1]
-    param_meta = TensorMeta(
-        torch.Size([n_channels]), (1,), input_spec.tensor_meta.dtype
-    )
-
-    if weight_spec is not None:
-        grad_weight_spec = DTensorSpec.from_dim_map(
-            input_spec.mesh, [-1], [0], tensor_meta=param_meta
-        )
-    else:
-        grad_weight_spec = None
-
-    grad_bias_spec = DTensorSpec.from_dim_map(
-        input_spec.mesh, [-1], [0], tensor_meta=param_meta
-    )
-
-    return OutputSharding([grad_input_spec, grad_weight_spec, grad_bias_spec])
+    return strategies
 
 
 # --------------------------------------------------------------------------- #
 # Group norm: per-sample, per-group stats → only batch-dim sharding is valid.
 # Unlike batch norm, group norm takes explicit N/C/HxW scalar args that must
 # be adjusted to the local batch size when the batch dim is sharded.
+# This scalar-arg rewriting requires redistribute_schema, which is only
+# available via register_prop_rule — single_dim_strategy has no equivalent.
 # --------------------------------------------------------------------------- #
 
 

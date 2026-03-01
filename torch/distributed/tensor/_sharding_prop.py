@@ -550,10 +550,14 @@ class ShardingPropagator:
                         # when the corresponding gradient is not needed. We allow
                         # TensorMeta to be None for these ops and replace the
                         # DTensorSpec with None in the output.
+                        # TODO: replace this allowlist with a generic check —
+                        # any op whose output_tensor_meta[i] is None should
+                        # produce None output, not just the ones listed here.
                         if (
                             op
                             in (
                                 aten.convolution_backward.default,
+                                aten.native_batch_norm_backward.default,
                                 aten.native_group_norm_backward.default,
                             )
                             and output_tensor_meta_i is None
