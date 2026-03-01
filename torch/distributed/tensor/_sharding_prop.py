@@ -327,6 +327,10 @@ class ShardingPropagator:
             self.propagate_op_sharding_non_cached
         )
         self.decomp_strategy = DecompShardingStrategy(self)
+        # Ops whose prop rules should take priority over auto-derived
+        # decomposition strategies. Used when the decomp can't handle
+        # op-specific semantics like explicit scalar arg adjustment.
+        self._decomp_skip_ops: set[OpOverload] = set()
         # op map to save indices of shape (and stride) args which may need to be
         # modified in sharding prop
         self.op_to_shape_and_stride_idx: dict[OpOverload, int | tuple[int, int]] = {
@@ -550,7 +554,11 @@ class ShardingPropagator:
                         # or grad_bias when bias is None). We explicitly allow the
                         # corresponding TensorMeta to be `None`.
                         if (
-                            op == aten.convolution_backward.default
+                            op
+                            in (
+                                aten.convolution_backward.default,
+                                aten.native_group_norm_backward.default,
+                            )
                             and i in (0, 1, 2)
                             and output_tensor_meta_i is None
                         ):
@@ -690,7 +698,10 @@ class ShardingPropagator:
             # try operator decomposition path
 
             op_strategy = None
-            if DecompShardingStrategy.has_decomp(op_schema.op):
+            if (
+                DecompShardingStrategy.has_decomp(op_schema.op)
+                and op_schema.op not in self._decomp_skip_ops
+            ):
                 # Ensure schema_info is registered for proper cache key computation
                 self.decomp_strategy.ensure_schema_info(op_schema.op)
                 try:

@@ -266,6 +266,8 @@ dtensor_fails = {
 
 dtensor_multi_threaded_fails = {
     xfail("full_like"),
+    xfail("linalg.eigh"),  # eigenvector sign ambiguity with batch-dim sharding
+    xfail("linalg.eigvalsh"),  # depends on eigh
     xfail("masked.cumprod"),
     xfail("nn.functional.dropout2d"),
     xfail("nn.functional.dropout3d"),
@@ -326,6 +328,10 @@ dtensor_compiled_fails = {
     xfail("index_select"),
     xfail("scatter"),
     xfail("scatter_add"),
+    # Upsample/interpolate: compile-time failure with single-dim strategy
+    xfail("nn.functional.interpolate", "nearest"),
+    xfail("nn.functional.interpolate", "nearest-exact"),
+    xfail("nn.functional.upsample_nearest"),
     # False positives: these have no sharding strategy and their
     # eager DTensor failure is registered elsewhere.
     xfail("nn.functional.margin_ranking_loss"),
@@ -340,6 +346,9 @@ dtensor_numeric_only_fails = {
     xfail("native_batch_norm"),
     xfail("nn.functional.batch_norm"),
     xfail("arange"),
+    # eigenvector sign ambiguity with batch-dim sharding
+    xfail("linalg.eigh"),
+    xfail("linalg.eigvalsh"),
     xfail("broadcast_shapes"),
     xfail("eye"),
     xfail("full"),
@@ -379,7 +388,6 @@ dtensor_fails_no_strategy = {
     xfail("_chunk_cat"),
     xfail("_unsafe_masked_index"),
     xfail("_unsafe_masked_index_put_accumulate"),
-    xfail("_upsample_bilinear2d_aa"),
     xfail("addbmm"),
     xfail("allclose"),
     xfail("as_strided"),
@@ -466,7 +474,6 @@ dtensor_fails_no_strategy = {
     xfail("masked.median"),
     xfail("masked_scatter"),
     xfail("matrix_exp"),
-    xfail("max_pool2d_with_indices_backward"),
     xfail("median"),
     xfail("mode"),
     xfail("multinomial"),
@@ -485,15 +492,10 @@ dtensor_fails_no_strategy = {
     xfail("nn.functional.avg_pool3d"),
     xfail("nn.functional.bilinear"),
     xfail("nn.functional.grid_sample"),
-    xfail("nn.functional.group_norm"),
     xfail("nn.functional.hardshrink"),
     xfail("nn.functional.instance_norm"),
     xfail("nn.functional.interpolate", "area"),
-    xfail("nn.functional.interpolate", "nearest"),
-    xfail("nn.functional.interpolate", "nearest-exact"),
     xfail("nn.functional.local_response_norm"),
-    xfail("nn.functional.max_pool1d"),
-    xfail("nn.functional.max_pool2d"),
     xfail("nn.functional.max_pool3d"),
     xfail("nn.functional.max_unpool1d"),
     xfail("nn.functional.max_unpool1d", "grad"),
@@ -510,7 +512,6 @@ dtensor_fails_no_strategy = {
     xfail("nn.functional.rrelu"),
     xfail("nn.functional.threshold"),
     xfail("nn.functional.unfold"),
-    xfail("nn.functional.upsample_nearest"),
     xfail("nonzero"),
     xfail("ormqr"),
     xfail("pinverse"),
@@ -717,10 +718,12 @@ class TestDTensorOps(TestCase):
                         dtensor_rs = concat_res_if_necessary(func, dtensor_rs)
                         try:
                             if resolve_name(func) not in skip_bw:
-                                if isinstance(dtensor_rs, DTensor):
-                                    dtensor_rs.to_local().sum().backward()
+                                # After tree_map(to_replicate, ...), results are
+                                # plain Tensors (not DTensors), so no .to_local().
+                                if isinstance(dtensor_rs, torch.Tensor):
+                                    dtensor_rs.sum().backward()
                                 elif isinstance(dtensor_rs, tuple):
-                                    dtensor_rs[0].to_local().sum().backward()
+                                    dtensor_rs[0].sum().backward()
 
                         except Exception as e:
                             # TODO(anj): Remove this guard exception after gaining more confidence.
@@ -1018,7 +1021,9 @@ ops_unbacked_dtensor_dde = {
     xfail("nn.functional.soft_margin_loss"),
     xfail("nn.functional.triplet_margin_loss"),
     xfail("nn.functional.triplet_margin_with_distance_loss"),
+    xfail("nn.functional.upsample_nearest"),
     xfail("nonzero_static"),
+    xfail("norm", "nuc"),
     xfail("outer"),
     xfail("permute_copy"),
     xfail("pow"),
@@ -1044,6 +1049,8 @@ ops_unbacked_dtensor_dde = {
     xfail("sub"),
     xfail("topk"),
     xfail("transpose_copy"),
+    xfail("tril"),
+    xfail("triu"),
     xfail("true_divide"),
     xfail("unflatten"),
     xfail("unsqueeze_copy"),
@@ -1254,8 +1261,11 @@ class TestSingleDimStrategies(DTensorOpTestBase):
             lambda s: Shard(s.dim),
             single_dim_strats[aten_op](aten_op, args_meta, kwargs_meta),
         )
-        # TODO(pianpwk): handle multi-output once that lands for single-dim
-        for output_placement, *input_placements in strategies:
+        num_outputs = len(aten_op._schema.returns)
+        for row in strategies:
+            output_placements = tuple(row[:num_outputs])
+            input_placements = list(row[num_outputs:])
+
             # skip strategies with invalid shards
             def is_invalid_shard(meta, p):
                 ndim = len(meta.shape)
@@ -1275,17 +1285,16 @@ class TestSingleDimStrategies(DTensorOpTestBase):
             ):
                 continue
 
-            # add the validate_sharding_rule function
             self.assertTrue(
                 validate_sharding_rule_sample(
                     aten_op,
                     full_args,
                     full_kwargs,
                     input_placements,
-                    (output_placement,),
+                    output_placements,
                     mesh,
                 ),
-                f"{op.name}: {input_placements} -> {(output_placement,)} failed",
+                f"{op.name}: {input_placements} -> {output_placements} failed",
             )
 
 

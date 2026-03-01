@@ -7,9 +7,11 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import ArgsType, KwargsType, OpSchema, OutputSharding
 from torch.distributed.tensor._ops.single_dim_strategy import (
     _ShardingPlaceholder,
+    batch_dim_strategies,
     register_single_dim_strategy,
 )
 from torch.distributed.tensor._ops.utils import register_prop_rule
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import Placement, Replicate
 
 
@@ -269,3 +271,232 @@ def native_batch_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
     )
 
     return OutputSharding([grad_input_spec, grad_weight_spec, grad_bias_spec])
+
+
+# --------------------------------------------------------------------------- #
+# Group norm: per-sample, per-group stats → only batch-dim sharding is valid.
+# Unlike batch norm, group norm takes explicit N/C/HxW scalar args that must
+# be adjusted to the local batch size when the batch dim is sharded.
+# --------------------------------------------------------------------------- #
+
+
+@register_prop_rule(aten.native_group_norm.default, skip_decomp=True)
+def native_group_norm_rules(op_schema: OpSchema) -> OutputSharding:
+    """Forward: native_group_norm(input, weight?, bias?, N, C, HxW, group, eps)
+    -> (output, mean, rstd)"""
+    (
+        input_spec,
+        weight_spec,
+        bias_spec,
+        N,
+        _C,
+        _HxW,
+        group,
+        _eps,
+    ) = op_schema.args_schema
+
+    assert isinstance(input_spec, DTensorSpec)
+    assert input_spec.tensor_meta is not None
+
+    # Build redistribution suggestions: input allows only batch-dim sharding,
+    # weight/bias must be Replicate.
+    suggest_args = list(op_schema.args_schema)
+    need_redistribute = False
+
+    input_unsupported = any(d != -1 for d in input_spec.dim_map[1:]) or bool(
+        input_spec.sums
+    )
+    if input_unsupported:
+        suggest_args[0] = DTensorSpec(
+            input_spec.mesh,
+            tuple(Replicate() for _ in input_spec.placements),
+            input_spec.tensor_meta,
+        )
+        need_redistribute = True
+
+    for idx, spec in ((1, weight_spec), (2, bias_spec)):
+        if isinstance(spec, DTensorSpec) and not all(
+            isinstance(p, Replicate) for p in spec.placements
+        ):
+            suggest_args[idx] = DTensorSpec(
+                spec.mesh,
+                tuple(Replicate() for _ in spec.placements),
+                spec.tensor_meta,
+            )
+            need_redistribute = True
+
+    # Compute output specs based on the TARGET input placement
+    target_input = suggest_args[0] if input_unsupported else input_spec
+    assert isinstance(target_input, DTensorSpec)
+
+    output_spec = DTensorSpec(
+        target_input.mesh, target_input.placements, target_input.tensor_meta
+    )
+
+    stats_meta = TensorMeta(
+        torch.Size([N, group]),
+        (group, 1),
+        input_spec.tensor_meta.dtype,
+    )
+    stats_spec = DTensorSpec.from_dim_map(
+        target_input.mesh,
+        [target_input.dim_map[0], -1],
+        [],
+        tensor_meta=stats_meta,
+    )
+    output_specs = [output_spec, stats_spec, stats_spec]
+
+    # Adjust scalar N to local batch size when batch-dim is sharded
+    if target_input.dim_map[0] != -1:
+        local_shape, _ = compute_local_shape_and_global_offset(
+            target_input.tensor_meta.shape,
+            target_input.mesh,
+            target_input.placements,
+            skip_offset=True,
+        )
+        suggest_args[3] = local_shape[0]
+        need_redistribute = True
+
+    if need_redistribute:
+        return OutputSharding(
+            output_specs,
+            redistribute_schema=OpSchema(
+                op_schema.op, tuple(suggest_args), op_schema.kwargs_schema
+            ),
+            needs_redistribute=True,
+            use_val_from_redistribute_schema=True,
+        )
+
+    return OutputSharding(output_specs)
+
+
+@register_prop_rule(aten.native_group_norm_backward.default, skip_decomp=True)
+def native_group_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
+    """Backward: native_group_norm_backward(grad_out, input, mean, rstd,
+    weight?, N, C, HxW, group, output_mask) -> (grad_input, grad_weight, grad_bias)"""
+    (
+        grad_out_spec,
+        input_spec,
+        _mean_spec,
+        _rstd_spec,
+        weight_spec,
+        _N,
+        _C,
+        _HxW,
+        _group,
+        _output_mask,
+    ) = op_schema.args_schema
+
+    assert isinstance(input_spec, DTensorSpec)
+    assert input_spec.tensor_meta is not None
+
+    suggest_args = list(op_schema.args_schema)
+    need_redistribute = False
+
+    # Only batch-dim sharding is valid (same constraint as forward).
+    # If input has non-batch sharding, redirect to Replicate.
+    input_unsupported = any(d != -1 for d in input_spec.dim_map[1:]) or bool(
+        input_spec.sums
+    )
+    if input_unsupported:
+        replicate_placements = tuple(Replicate() for _ in input_spec.placements)
+        suggest_args[1] = DTensorSpec(
+            input_spec.mesh, replicate_placements, input_spec.tensor_meta
+        )
+        need_redistribute = True
+
+    # Use the target placement for output specs (after potential redistribution)
+    target_input = suggest_args[1] if input_unsupported else input_spec
+    assert isinstance(target_input, DTensorSpec)
+
+    # grad_out must match input's target placement
+    if isinstance(grad_out_spec, DTensorSpec):
+        if grad_out_spec.placements != target_input.placements:
+            suggest_args[0] = DTensorSpec(
+                grad_out_spec.mesh, target_input.placements, grad_out_spec.tensor_meta
+            )
+            need_redistribute = True
+
+    # weight must be Replicate
+    if isinstance(weight_spec, DTensorSpec) and not all(
+        isinstance(p, Replicate) for p in weight_spec.placements
+    ):
+        suggest_args[4] = DTensorSpec(
+            weight_spec.mesh,
+            tuple(Replicate() for _ in weight_spec.placements),
+            weight_spec.tensor_meta,
+        )
+        need_redistribute = True
+
+    n_channels = input_spec.tensor_meta.shape[1]
+    param_meta = TensorMeta(
+        torch.Size([n_channels]), (1,), input_spec.tensor_meta.dtype
+    )
+
+    # grad_weight/grad_bias need Partial("sum") on the batch-sharded mesh dim
+    batch_mesh_dim = target_input.dim_map[0]
+    sums = [batch_mesh_dim] if batch_mesh_dim != -1 else []
+
+    grad_input_spec = target_input
+
+    if isinstance(weight_spec, DTensorSpec):
+        grad_weight_spec = DTensorSpec.from_dim_map(
+            input_spec.mesh, [-1], sums, tensor_meta=param_meta
+        )
+    else:
+        grad_weight_spec = None
+
+    grad_bias_spec = DTensorSpec.from_dim_map(
+        input_spec.mesh, [-1], sums, tensor_meta=param_meta
+    )
+
+    output_specs = [grad_input_spec, grad_weight_spec, grad_bias_spec]
+
+    # Adjust scalar N to local batch size when batch-dim is sharded
+    if batch_mesh_dim != -1:
+        local_shape, _ = compute_local_shape_and_global_offset(
+            target_input.tensor_meta.shape,
+            target_input.mesh,
+            target_input.placements,
+            skip_offset=True,
+        )
+        suggest_args[5] = local_shape[0]  # local N (index 5 in backward)
+        need_redistribute = True
+
+    if need_redistribute:
+        return OutputSharding(
+            output_specs,
+            redistribute_schema=OpSchema(
+                op_schema.op, tuple(suggest_args), op_schema.kwargs_schema
+            ),
+            needs_redistribute=True,
+            use_val_from_redistribute_schema=True,
+        )
+
+    return OutputSharding(output_specs)
+
+
+# --------------------------------------------------------------------------- #
+# MaxPool2d: last 2 dims (spatial) coupled by pooling kernel;
+# all leading dims independently shardable.
+# --------------------------------------------------------------------------- #
+
+
+@register_single_dim_strategy([aten.max_pool2d_with_indices.default])
+def max_pool2d_fwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    assert isinstance(input_meta, TensorMeta)
+    # 2 outputs (values, indices) + 1 input; last 2 dims are spatial
+    return batch_dim_strategies(len(input_meta.shape) - 2, num_slots=3)
+
+
+@register_single_dim_strategy([aten.max_pool2d_with_indices_backward.default])
+def max_pool2d_bwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[1]  # self (the forward input)
+    assert isinstance(input_meta, TensorMeta)
+    # 1 output + 3 tensor inputs (grad_output, self, indices); last 2 dims are spatial
+    return batch_dim_strategies(len(input_meta.shape) - 2, num_slots=4)
