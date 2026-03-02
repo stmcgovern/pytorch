@@ -381,26 +381,79 @@ def native_group_norm_backward_rules(op_schema: OpSchema) -> OutputSharding:
 
 
 # --------------------------------------------------------------------------- #
-# MaxPool2d: last 2 dims (spatial) coupled by pooling kernel;
-# all leading dims independently shardable.
+# Pooling: spatial dims coupled by kernel, leading dims (N, C) shardable.
+# All pooling ops share shape (N, C, ...spatial) with ndim - 2 spatial dims.
 # --------------------------------------------------------------------------- #
 
 
-@register_single_dim_strategy([aten.max_pool2d_with_indices.default])
-def max_pool2d_fwd_single_dim_strategy(
+def _pool_num_spatial(op: OpOverload) -> int:
+    """Return the number of spatial dims for a pooling op (2 or 3)."""
+    return 3 if "3d" in op.name() else 2
+
+
+@register_single_dim_strategy(
+    [
+        aten.max_pool2d_with_indices.default,
+        aten.max_pool3d_with_indices.default,
+        aten.adaptive_max_pool2d.default,
+        aten.adaptive_max_pool3d.default,
+    ],
+)
+def max_pool_fwd_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
     input_meta = args_schema[0]
     assert isinstance(input_meta, TensorMeta)
-    # 2 outputs (values, indices) + 1 input; last 2 dims are spatial
-    return batch_dim_strategies(len(input_meta.shape) - 2, num_slots=3)
+    # 2 outputs (values, indices) + 1 input
+    return batch_dim_strategies(len(input_meta.shape) - _pool_num_spatial(op), num_slots=3)
 
 
-@register_single_dim_strategy([aten.max_pool2d_with_indices_backward.default])
-def max_pool2d_bwd_single_dim_strategy(
+@register_single_dim_strategy(
+    [
+        aten.max_pool2d_with_indices_backward.default,
+        aten.max_pool3d_with_indices_backward.default,
+        aten.adaptive_max_pool2d_backward.default,
+        aten.adaptive_max_pool3d_backward.default,
+    ],
+)
+def max_pool_bwd_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
     input_meta = args_schema[1]  # self (the forward input)
     assert isinstance(input_meta, TensorMeta)
-    # 1 output + 3 tensor inputs (grad_output, self, indices); last 2 dims are spatial
-    return batch_dim_strategies(len(input_meta.shape) - 2, num_slots=4)
+    # 1 output + 3 tensor inputs (grad_output, self, indices)
+    return batch_dim_strategies(len(input_meta.shape) - _pool_num_spatial(op), num_slots=4)
+
+
+@register_single_dim_strategy(
+    [
+        aten._adaptive_avg_pool2d.default,
+        aten._adaptive_avg_pool3d.default,
+        aten.avg_pool2d.default,
+        aten.avg_pool3d.default,
+    ],
+)
+def avg_pool_fwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    assert isinstance(input_meta, TensorMeta)
+    # 1 output + 1 input
+    return batch_dim_strategies(len(input_meta.shape) - _pool_num_spatial(op), num_slots=2)
+
+
+@register_single_dim_strategy(
+    [
+        aten._adaptive_avg_pool2d_backward.default,
+        aten._adaptive_avg_pool3d_backward.default,
+        aten.avg_pool2d_backward.default,
+        aten.avg_pool3d_backward.default,
+    ],
+)
+def avg_pool_bwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[1]  # self (the forward input)
+    assert isinstance(input_meta, TensorMeta)
+    # 1 output + 2 tensor inputs (grad_output, self)
+    return batch_dim_strategies(len(input_meta.shape) - _pool_num_spatial(op), num_slots=3)
