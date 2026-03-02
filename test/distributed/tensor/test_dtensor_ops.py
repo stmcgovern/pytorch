@@ -195,6 +195,7 @@ dtensor_fails = {
     xfail("nn.functional.conv1d"),
     xfail("nn.functional.conv2d"),
     xfail("nn.functional.conv3d"),
+    # conv_transpose: local shard spatial dims too small for kernel after sharding
     xfail("nn.functional.conv_transpose1d"),
     xfail("nn.functional.conv_transpose2d"),
     xfail("nn.functional.conv_transpose3d"),
