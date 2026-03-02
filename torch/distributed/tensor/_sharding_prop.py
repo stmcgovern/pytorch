@@ -545,31 +545,19 @@ class ShardingPropagator:
                 if isinstance(spec, DTensorSpec):
                     output_tensor_meta_i = output_tensor_meta[i]
                     if not isinstance(output_tensor_meta_i, TensorMeta):
-                        # NOTE: Backward ops with output_mask (e.g. convolution_backward,
-                        # native_group_norm_backward) can return None for any output
-                        # when the corresponding gradient is not needed. We allow
-                        # TensorMeta to be None for these ops and replace the
-                        # DTensorSpec with None in the output.
-                        # TODO: replace this allowlist with a generic check —
-                        # any op whose output_tensor_meta[i] is None should
-                        # produce None output, not just the ones listed here.
-                        if (
-                            op
-                            in (
-                                aten.convolution_backward.default,
-                                aten.native_batch_norm_backward.default,
-                                aten.native_group_norm_backward.default,
-                            )
-                            and output_tensor_meta_i is None
-                        ):
+                        # Backward ops with output_mask (e.g. convolution_backward,
+                        # native_group_norm_backward) can return None for any
+                        # output when the corresponding gradient is not needed.
+                        # Fake tensor propagation already evaluates output_mask,
+                        # so a None tensor_meta here is authoritative.
+                        if output_tensor_meta_i is None:
                             assert isinstance(output_specs, list)
                             new_specs.append(None)
                             continue
-                        else:
-                            raise ValueError(
-                                f"ShardingPropagator error: output {i} of {op.name()} "
-                                "does not have an associated TensorMeta"
-                            )
+                        raise ValueError(
+                            f"ShardingPropagator error: output {i} of {op.name()} "
+                            "does not have an associated TensorMeta"
+                        )
 
                     new_specs.append(
                         spec.shallow_copy_with_tensor_meta(output_tensor_meta_i)
