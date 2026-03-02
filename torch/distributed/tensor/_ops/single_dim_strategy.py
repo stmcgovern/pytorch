@@ -46,6 +46,19 @@ class _ShardingPlaceholder:
         return f"_ShardingPlaceholder(dim={self.dim})"
 
 
+def batch_dim_strategies(
+    num_shardable: int, num_slots: int
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """Return strategies that shard on each batch dim independently.
+
+    ``num_shardable`` is the number of leading dims that can be independently
+    sharded (e.g. ``ndim - 2`` for ops whose last 2 dims are coupled, or
+    ``min(2, ndim)`` for ops where N and C are always the first 2 dims).
+    ``num_slots`` is ``#outputs + #tensor_inputs``.
+    """
+    return [[_ShardingPlaceholder(d)] * num_slots for d in range(num_shardable)]
+
+
 _StrategyTypeT = TypeVar("_StrategyTypeT", bound=StrategyType)
 _PlacementT = TypeVar("_PlacementT", bound=Placement)
 _ShardingPlaceholderT = TypeVar("_ShardingPlaceholderT", bound=_ShardingPlaceholder)

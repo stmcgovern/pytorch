@@ -1118,8 +1118,30 @@ def validate_sharding_rule_sample(
     # run and compare
     ref_output = op(*full_args, **full_kwargs)
     local_output = op(*local_args, **local_kwargs)
-    output_dt = DTensor.from_local(local_output, device_mesh, output_placements)
-    full_output = output_dt.redistribute(device_mesh, (Replicate(),)).to_local()
-    return ref_output.shape == full_output.shape and torch.allclose(
-        ref_output, full_output, atol=1e-5, rtol=1e-5
+
+    # Normalize to list for uniform handling of single/multi-output ops.
+    # output_placements has one Placement per output (assumes 1D mesh).
+    if isinstance(ref_output, torch.Tensor):
+        ref_outputs = [ref_output]
+        local_outputs = [local_output]
+    else:
+        ref_outputs = list(ref_output)
+        local_outputs = list(local_output)
+
+    assert len(ref_outputs) == len(output_placements), (
+        f"output count mismatch: op returned {len(ref_outputs)} outputs "
+        f"but got {len(output_placements)} placements"
     )
+
+    for ref_out, local_out, out_p in zip(ref_outputs, local_outputs, output_placements):
+        if ref_out is None and local_out is None:
+            continue
+        if (ref_out is None) != (local_out is None):
+            return False
+        output_dt = DTensor.from_local(local_out, device_mesh, (out_p,))
+        full_out = output_dt.redistribute(device_mesh, (Replicate(),)).to_local()
+        if ref_out.shape != full_out.shape or not torch.allclose(
+            ref_out, full_out, atol=1e-5, rtol=1e-5
+        ):
+            return False
+    return True

@@ -7,15 +7,23 @@ from enum import Enum
 from typing import cast, Union
 
 import torch
+from torch._ops import OpOverload
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import (
+    ArgsType,
+    KwargsType,
     OpSchema,
     OpSpec,
     OpStrategy,
     PlacementList,
     RuntimeSchemaInfo,
     TupleStrategy,
+)
+from torch.distributed.tensor._ops.single_dim_strategy import (
+    _ShardingPlaceholder,
+    batch_dim_strategies,
+    register_single_dim_strategy,
 )
 from torch.distributed.tensor._ops.utils import (
     as_list,
@@ -596,30 +604,19 @@ def foreach_max_strategy(op_schema: OpSchema) -> TupleStrategy:
 
 @register_op_strategy(
     [
-        aten._linalg_svd.default,
-        aten.linalg_qr.default,
         # TODO: The diagonal ops can have an improved sharding strategy for
         # shard placements that does not require redistributing to replicate.
         aten.diagonal_copy.default,
         aten.diag_embed.default,
         aten.diag.default,
         aten.diagonal.default,
-        aten.tril.default,
-        aten.triu.default,
-        aten._linalg_eigh.default,
-        aten.upsample_bicubic2d.default,
-        aten.upsample_bilinear2d.default,
-        aten.upsample_linear1d.default,
-        aten.upsample_nearest2d.default,
-        aten.upsample_trilinear3d.default,
-        # TODO: support the full F.interpolate set of options.
     ],
     schema_info=RuntimeSchemaInfo(1),
 )
-def linalg_replicate_strategy(op_schema: OpSchema) -> OpStrategy:
+def diagonal_replicate_strategy(op_schema: OpSchema) -> OpStrategy:
     """
-    Since we do not have a simple way to compute some linear algebra operations
-    like SVD or QR decomposition, always fall back to replicate.
+    Always fall back to replicate for ops where batch-dim sharding
+    is non-trivial (e.g. diagonal ops with configurable dim1/dim2).
     """
     args_schema = op_schema.args_schema
     input_strategy = args_schema[0]
@@ -645,6 +642,95 @@ def linalg_replicate_strategy(op_schema: OpSchema) -> OpStrategy:
         )
         output_strategies.append(replicate_strategy)
     return OpStrategy(output_strategies)
+
+
+# --------------------------------------------------------------------------- #
+# Linalg decompositions and triangular masking
+# --------------------------------------------------------------------------- #
+# SVD, QR, eigh: last 2 (matrix) dims not independently shardable.
+# tril, triu: mask depends on position within last 2 dims.
+# All share the pattern: leading dims independently shardable, last 2 coupled.
+
+
+@register_single_dim_strategy([aten._linalg_svd.default])
+def linalg_svd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    assert isinstance(input_meta, TensorMeta)
+    return batch_dim_strategies(len(input_meta.shape) - 2, num_slots=4)  # U, S, Vh + input
+
+
+@register_single_dim_strategy([aten.linalg_qr.default, aten._linalg_eigh.default])
+def linalg_decomp_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    assert isinstance(input_meta, TensorMeta)
+    return batch_dim_strategies(len(input_meta.shape) - 2, num_slots=3)  # 2 outputs + input
+
+
+@register_single_dim_strategy([aten.tril.default, aten.triu.default])
+def tril_triu_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    assert isinstance(input_meta, TensorMeta)
+    return batch_dim_strategies(len(input_meta.shape) - 2, num_slots=2)
+
+
+# --------------------------------------------------------------------------- #
+# Upsample / interpolate
+# --------------------------------------------------------------------------- #
+# Shape (N, C, ...spatial): batch (0) and channel (1) freely shardable.
+
+
+@register_single_dim_strategy(
+    [
+        aten.upsample_linear1d.default,
+        aten.upsample_nearest1d.default,
+        aten._upsample_nearest_exact1d.default,
+        aten.upsample_nearest2d.default,
+        aten.upsample_bilinear2d.default,
+        aten.upsample_bicubic2d.default,
+        aten._upsample_nearest_exact2d.default,
+        aten._upsample_bilinear2d_aa.default,
+        aten._upsample_bicubic2d_aa.default,
+        aten.upsample_nearest3d.default,
+        aten.upsample_trilinear3d.default,
+        aten._upsample_nearest_exact3d.default,
+    ],
+)
+def upsample_fwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    assert isinstance(input_meta, TensorMeta)
+    return batch_dim_strategies(min(2, len(input_meta.shape)), num_slots=2)
+
+
+@register_single_dim_strategy(
+    [
+        aten.upsample_nearest1d_backward.default,
+        aten._upsample_nearest_exact1d_backward.default,
+        aten.upsample_linear1d_backward.default,
+        aten.upsample_nearest2d_backward.default,
+        aten._upsample_nearest_exact2d_backward.default,
+        aten.upsample_bilinear2d_backward.default,
+        aten.upsample_bicubic2d_backward.default,
+        aten._upsample_bilinear2d_aa_backward.default,
+        aten._upsample_bicubic2d_aa_backward.default,
+        aten.upsample_nearest3d_backward.default,
+        aten._upsample_nearest_exact3d_backward.default,
+        aten.upsample_trilinear3d_backward.default,
+    ],
+)
+def upsample_bwd_single_dim_strategy(
+    op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]  # grad_output
+    assert isinstance(input_meta, TensorMeta)
+    return batch_dim_strategies(min(2, len(input_meta.shape)), num_slots=2)
 
 
 @register_op_strategy(

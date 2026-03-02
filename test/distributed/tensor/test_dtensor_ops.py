@@ -306,8 +306,11 @@ dtensor_compiled_fails = {
     xfail("nn.functional.interpolate", "bicubic"),
     xfail("nn.functional.interpolate", "bilinear"),
     xfail("nn.functional.interpolate", "linear"),
+    xfail("nn.functional.interpolate", "nearest"),
+    xfail("nn.functional.interpolate", "nearest-exact"),
     xfail("nn.functional.interpolate", "trilinear"),
     xfail("nn.functional.upsample_bilinear"),
+    xfail("nn.functional.upsample_nearest"),
     # Data-dependent outputs (SymBool, unbacked shapes) that raise
     # during DTensor's fake prop.
     xfail("equal"),
@@ -325,10 +328,6 @@ dtensor_compiled_fails = {
     xfail("index_select"),
     xfail("scatter"),
     xfail("scatter_add"),
-    # Upsample/interpolate: compile-time failure with single-dim strategy
-    xfail("nn.functional.interpolate", "nearest"),
-    xfail("nn.functional.interpolate", "nearest-exact"),
-    xfail("nn.functional.upsample_nearest"),
     # False positives: these have no sharding strategy and their
     # eager DTensor failure is registered elsewhere.
     xfail("nn.functional.margin_ranking_loss"),
@@ -998,8 +997,6 @@ ops_unbacked_dtensor_dde = {
     xfail("nn.functional.hardsigmoid"),
     xfail("nn.functional.hardtanh"),
     xfail("nn.functional.hinge_embedding_loss"),
-    xfail("nn.functional.interpolate", "nearest"),
-    xfail("nn.functional.interpolate", "nearest-exact"),
     xfail("nn.functional.linear"),
     xfail("nn.functional.logsigmoid"),
     xfail("nn.functional.margin_ranking_loss"),
@@ -1014,7 +1011,6 @@ ops_unbacked_dtensor_dde = {
     xfail("nn.functional.soft_margin_loss"),
     xfail("nn.functional.triplet_margin_loss"),
     xfail("nn.functional.triplet_margin_with_distance_loss"),
-    xfail("nn.functional.upsample_nearest"),
     xfail("nonzero_static"),
     xfail("norm", "nuc"),
     xfail("outer"),
