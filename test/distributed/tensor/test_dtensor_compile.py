@@ -1646,9 +1646,8 @@ class outer_fn(torch.nn.Module):
         produces plain (non-DTensor) tensors that must be implicitly treated as
         Replicate during compile tracing."""
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
-        x = DTensor.from_local(
-            torch.randn(2, 3, 4, 4), mesh, [Replicate()], run_check=False
-        )
+        local = torch.randn(2, 3, 4, 4, requires_grad=True)
+        x = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
 
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn(t):
@@ -1659,6 +1658,11 @@ class outer_fn(torch.nn.Module):
         result = fn(x)
         self.assertEqual(result.shape, torch.Size([2, 3, 8, 8]))
         self.assertEqual(result.placements, (Replicate(),))
+
+        # Backward: the decomposition's backward uses _unsafe_index_put
+        # which also needs DTensor support.
+        result.sum().backward()
+        self.assertEqual(local.grad.shape, torch.Size([2, 3, 4, 4]))
 
 
 @instantiate_parametrized_tests

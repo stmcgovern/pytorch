@@ -583,6 +583,9 @@ class ShardingPropagator:
             elif (
                 isinstance(spec, (list, tuple))
                 and len(spec) > 0
+                # TODO: this misses lists where leading elements are None
+                # (e.g. Tensor?[] indices [None, None, idx]). Ops hitting
+                # that pattern need a prop_rule instead of op_strategy.
                 and isinstance(spec[0], DTensorSpec)
             ):
                 # tensor list create tuple strategy

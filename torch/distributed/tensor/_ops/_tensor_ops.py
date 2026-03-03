@@ -1211,6 +1211,69 @@ def prop_index(op_schema: OpSchema) -> OutputSharding:
         return result
 
 
+@register_prop_rule(
+    aten._unsafe_index_put.default,
+    schema_info=RuntimeSchemaInfo(needs_pytree=True),
+)
+def prop_unsafe_index_put(op_schema: OpSchema) -> OutputSharding:
+    """_unsafe_index_put(self, indices, values, accumulate) — same semantics as
+    index_put but skips bounds checking. Its indices list (Tensor?[]) can
+    contain None entries for unindexed dims, which the op_strategy-based
+    prop_index_put can't handle. Use a simple prop_rule: require all
+    inputs replicated."""
+    self_spec, multi_indices_spec, values_spec, *_ = op_schema.args_schema
+    if not isinstance(self_spec, DTensorSpec):
+        raise AssertionError(f"Expected DTensorSpec, got {type(self_spec)}")
+    if not isinstance(values_spec, DTensorSpec):
+        raise AssertionError(f"Expected DTensorSpec, got {type(values_spec)}")
+
+    mesh = self_spec.mesh
+    replicated = (Replicate(),) * mesh.ndim
+
+    all_replicated = (
+        self_spec.placements == replicated
+        and values_spec.placements == replicated
+        and all(
+            s is None or s.placements == replicated
+            for s in cast(list[DTensorSpec | None], multi_indices_spec)
+        )
+    )
+
+    if all_replicated:
+        return OutputSharding(
+            output_spec=DTensorSpec(mesh=mesh, placements=replicated)
+        )
+
+    # Redistribute everything to replicated
+    new_indices = [
+        DTensorSpec(mesh=mesh, placements=replicated, tensor_meta=s.tensor_meta)
+        if s is not None
+        else None
+        for s in cast(list[DTensorSpec | None], multi_indices_spec)
+    ]
+    return OutputSharding(
+        output_spec=None,
+        redistribute_schema=OpSchema(
+            op=op_schema.op,
+            args_schema=(
+                DTensorSpec(
+                    mesh=mesh,
+                    placements=replicated,
+                    tensor_meta=self_spec.tensor_meta,
+                ),
+                new_indices,
+                DTensorSpec(
+                    mesh=mesh,
+                    placements=replicated,
+                    tensor_meta=values_spec.tensor_meta,
+                ),
+                *op_schema.args_schema[3:],
+            ),
+            kwargs_schema=op_schema.kwargs_schema,
+        ),
+    )
+
+
 @register_op_strategy(
     [
         aten.split.Tensor,
