@@ -1079,7 +1079,10 @@ def prop_index_put(op_schema: OpSchema) -> StrategyType:
     return op_strategy
 
 
-@register_prop_rule(aten.index.Tensor, schema_info=RuntimeSchemaInfo(needs_pytree=True))
+@register_prop_rule(
+    [aten.index.Tensor, aten._unsafe_index.Tensor],
+    schema_info=RuntimeSchemaInfo(needs_pytree=True),
+)
 def prop_index(op_schema: OpSchema) -> OutputSharding:
     """
     Expect replicated on the first input; _mostly_ pointwise on the second input.
