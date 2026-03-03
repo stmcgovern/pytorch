@@ -2161,6 +2161,10 @@ static py::object try_find_mesh_from_args(
       false, "Cannot find device mesh from args for op : ", op.operator_name());
 }
 
+DEFINE_CACHING_PYTHON_IMPORT_GETTER(
+    get_is_fake_fn,
+    py::module::import("torch._subclasses.fake_tensor").attr("is_fake"))
+
 static /*DTensorSpec*/ py::object try_replicate_spec_for_scalar_tensor(
     bool allow_implicit_replication,
     py::handle op_call,
@@ -2176,12 +2180,19 @@ static /*DTensorSpec*/ py::object try_replicate_spec_for_scalar_tensor(
         "or explicitly create a DTensor under distributed environment.");
   }
 
+  // FakeTensor (or FunctionalTensor wrapping FakeTensor) means we are
+  // in compile tracing. Factory ops in decompositions (torch.arange,
+  // etc.) produce plain tensors that are deterministic across ranks,
+  // so treating them as Replicate is semantically correct.
+  const bool is_fake =
+      !numel_is_one && !allow_implicit_replication &&
+      py::cast<bool>(get_is_fake_fn()(py_tensor));
+
   TORCH_CHECK(
-      numel_is_one || allow_implicit_replication,
+      numel_is_one || allow_implicit_replication || is_fake,
       py::str(op_call),
       " got mixed torch.Tensor and DTensor, need to convert all torch.Tensor to DTensor before calling distributed operators!");
 
-  // scalar tensor can be safely treated as replicated.
   const auto num_placements =
       py::cast<Py_ssize_t>(compute_mesh.attr(dtensor_interned_strings.ndim));
   py::tuple placements_tuple(num_placements);

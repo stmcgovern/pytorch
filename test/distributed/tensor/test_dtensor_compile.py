@@ -1640,6 +1640,26 @@ class outer_fn(torch.nn.Module):
         # Test backward pass
         result.sum().backward()
 
+    def test_compile_decomposition_with_factory_ops(self):
+        """Ops whose decompositions call factory functions (torch.arange, etc.)
+        should work under torch.compile with DTensor inputs.  The decomposition
+        produces plain (non-DTensor) tensors that must be implicitly treated as
+        Replicate during compile tracing."""
+        mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+        x = DTensor.from_local(
+            torch.randn(2, 3, 4, 4), mesh, [Replicate()], run_check=False
+        )
+
+        @torch.compile(backend="aot_eager", fullgraph=True)
+        def fn(t):
+            return torch.nn.functional.interpolate(
+                t, scale_factor=2, mode="bilinear", align_corners=False
+            )
+
+        result = fn(x)
+        self.assertEqual(result.shape, torch.Size([2, 3, 8, 8]))
+        self.assertEqual(result.placements, (Replicate(),))
+
 
 @instantiate_parametrized_tests
 class TestDTensorCompileE2E(DTensorTestBase):

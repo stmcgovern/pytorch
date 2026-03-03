@@ -687,8 +687,17 @@ class OpDispatcher:
                 stacklevel=2,
             )
 
-        if tensor_arg.numel() == 1 or self._allow_implicit_replication:
-            # scalar tensor can be safely treated as replicated
+        # FakeTensor (or FunctionalTensor wrapping FakeTensor) means we
+        # are in compile tracing. Factory ops in decompositions produce
+        # plain tensors that are deterministic across ranks — Replicate
+        # is correct.
+        from torch._subclasses.fake_tensor import is_fake
+
+        if (
+            tensor_arg.numel() == 1
+            or self._allow_implicit_replication
+            or is_fake(tensor_arg)
+        ):
             replication_spec = DTensorSpec(
                 compute_mesh,
                 (Replicate(),) * compute_mesh.ndim,
