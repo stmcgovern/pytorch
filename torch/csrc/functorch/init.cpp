@@ -243,16 +243,89 @@ static RandomnessType get_randomness_enum(const std::string& randomness) {
   }
 }
 
+// NOTE: [functorch transform TLS side effects]
+// When a functorch transform is entered (_grad_increment_nesting,
+// _jvp_increment_nesting), it may modify TLS state beyond the DynamicLayer
+// stack. Currently, Grad and Jvp transforms disable inference_mode if active.
+// Any new TLS side effects added to the increment functions MUST also be undone
+// in _undo_dynamic_layer_side_effects, which is used by both the normal
+// decrement path and the Dynamo error-recovery path
+// (popDynamicLayerStackToDepth).
+//
+// Why only inference_mode and not grad_mode/fw_grad_mode/multithreading?
+// - grad_mode/fw_grad_mode: saved and restored by the transform's own
+//   prev_grad_mode/prev_fwd_grad_mode mechanism in DynamicLayerBackFallback.
+// - multithreading_enabled: not used by functorch transforms.
+
+// Disable inference_mode for a functorch transform. Mirrors the keyset logic
+// in InferenceMode(false) (see c10/core/InferenceMode.h). We can't use
+// InferenceMode RAII because the save/restore is split across
+// increment/decrement calls. Returns true if inference mode was previously on.
+static bool _disable_inference_mode_for_transform() {
+  auto state = c10::AutogradState::get_tls_state();
+  if (!state.get_inference_mode()) {
+    return false;
+  }
+  state.set_inference_mode(false);
+  c10::AutogradState::set_tls_state(state);
+
+  auto keyset = c10::impl::tls_local_dispatch_key_set();
+  c10::impl::PODLocalDispatchKeySet new_keyset{};
+  new_keyset.set_included(
+      keyset.included_.add(c10::DispatchKey::ADInplaceOrView));
+  new_keyset.set_excluded(
+      keyset.excluded_ - c10::autograd_dispatch_keyset);
+  c10::impl::_force_tls_local_dispatch_key_set(new_keyset);
+  return true;
+}
+
+static void _restore_inference_mode_for_transform(bool prev_inference_mode) {
+  if (!prev_inference_mode) {
+    return;
+  }
+  auto state = c10::AutogradState::get_tls_state();
+  state.set_inference_mode(true);
+  c10::AutogradState::set_tls_state(state);
+
+  auto keyset = c10::impl::tls_local_dispatch_key_set();
+  c10::impl::PODLocalDispatchKeySet new_keyset{};
+  new_keyset.set_included(
+      keyset.included_.remove(c10::DispatchKey::ADInplaceOrView));
+  new_keyset.set_excluded(
+      keyset.excluded_ | c10::autograd_dispatch_keyset);
+  c10::impl::_force_tls_local_dispatch_key_set(new_keyset);
+}
+
 static int64_t _grad_increment_nesting() {
   // See NOTE [grad and vjp interaction with no_grad]
   bool prev_grad_mode = c10::GradMode::is_enabled();
+  // See NOTE: [functorch transform TLS side effects]
+  bool prev_inference_mode = _disable_inference_mode_for_transform();
   return initAndPushDynamicLayer(
-      TransformType::Grad, std::nullopt, std::nullopt, prev_grad_mode);
+      TransformType::Grad, std::nullopt, std::nullopt, prev_grad_mode,
+      std::nullopt, std::nullopt, prev_inference_mode);
+}
+
+// See NOTE: [functorch transform TLS side effects]
+static void _undo_dynamic_layer_side_effects(const DynamicLayer& layer) {
+  switch (layer.key()) {
+    case TransformType::Grad:
+      _restore_inference_mode_for_transform(
+          std::get<GradInterpreterMeta>(layer.interpreter().meta()).prevInferenceMode_);
+      break;
+    case TransformType::Jvp:
+      _restore_inference_mode_for_transform(
+          std::get<JvpInterpreterMeta>(layer.interpreter().meta()).prevInferenceMode_);
+      break;
+    default:
+      break;
+  }
 }
 
 static int64_t _grad_decrement_nesting() {
   auto layer = popDynamicLayerAndDeleteMetadata();
   TORCH_INTERNAL_ASSERT(layer.key() == TransformType::Grad);
+  _undo_dynamic_layer_side_effects(layer);
   return layer.layerId();
 }
 
@@ -260,17 +333,21 @@ static int64_t _jvp_increment_nesting() {
   // See NOTE [grad and vjp interaction with no_grad]
   bool prev_fwd_grad_mode =
       c10::AutogradState::get_tls_state().get_fw_grad_mode();
+  bool prev_inference_mode = _disable_inference_mode_for_transform();
   return initAndPushDynamicLayer(
       TransformType::Jvp,
       std::nullopt,
       std::nullopt,
       std::nullopt,
-      prev_fwd_grad_mode);
+      prev_fwd_grad_mode,
+      std::nullopt,
+      prev_inference_mode);
 }
 
 static int64_t _jvp_decrement_nesting() {
   auto layer = popDynamicLayerAndDeleteMetadata();
   TORCH_INTERNAL_ASSERT(layer.key() == TransformType::Jvp);
+  _undo_dynamic_layer_side_effects(layer);
   return layer.layerId();
 }
 
@@ -416,26 +493,11 @@ static void dump_local_tls() {
 namespace {
 
 // Pop the DynamicLayer stack until it's at the given depth.
+// Used by Dynamo for error-recovery cleanup.
 void popDynamicLayerStackToDepth(size_t depth) {
   while (at::functorch::getDynamicLayerStack().size() > depth) {
-    const auto top = popDynamicLayer();
-    switch (top.key()) {
-      case at::functorch::TransformType::Vmap:
-        _vmap_decrement_nesting();
-        break;
-      case at::functorch::TransformType::Grad:
-        _grad_decrement_nesting();
-        break;
-      case at::functorch::TransformType::Jvp:
-        _jvp_decrement_nesting();
-        break;
-      case at::functorch::TransformType::Functionalize:
-        _func_decrement_nesting();
-        break;
-      case at::functorch::TransformType::Torch:
-        popDynamicLayerAndDeleteMetadata();
-        break;
-    }
+    auto layer = popDynamicLayerAndDeleteMetadata();
+    _undo_dynamic_layer_side_effects(layer);
   }
 }
 

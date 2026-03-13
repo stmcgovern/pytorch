@@ -214,6 +214,10 @@ def _autograd_grad(
 # To achieve this behavior, upon entering grad/vjp:
 # - we save the current ("previous") is_grad_enabled (*)
 # - we unconditionally enable grad.
+# - _grad/_jvp_increment_nesting (C++) disables inference_mode if active,
+#   since inference_mode excludes autograd dispatch keys from TLS and
+#   causes tensors to be constructed without autograd metadata.
+#   See NOTE: [functorch transform TLS side effects] in init.cpp.
 #
 # Inside DynamicLayerBackFallback, when we're temporarily popping `grad` layer
 # off the stack:

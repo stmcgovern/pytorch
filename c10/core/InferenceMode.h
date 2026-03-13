@@ -51,6 +51,9 @@ struct C10_API InferenceMode {
   //    version of NoGradGuard. All runtime checks using GradMode::is_enabled()
   //    are applicable to InferenceMode as well, e.g.
   //    `tensorTypeInCurrentExecutionContext` in interpreter.cpp.
+  // NOTE: functorch manually mirrors the keyset logic below in
+  // _disable/_restore_inference_mode_for_transform (torch/csrc/functorch/init.cpp).
+  // Changes here must be reflected there.
   InferenceMode(bool enabled = true)
       : prev_mode(AutogradState::get_tls_state()),
         prev_keyset(c10::impl::tls_local_dispatch_key_set()) {

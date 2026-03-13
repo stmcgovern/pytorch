@@ -1152,6 +1152,207 @@ class TestGradTransform(TestCase):
         (z,) = torch.autograd.grad(y, x)
         self.assertEqual(z, 2)
 
+    def test_inference_mode_outside_grad(self, device):
+        x = torch.randn(3, device=device)
+        with torch.inference_mode():
+            y = grad(lambda x: (x**2).sum())(x)
+        self.assertEqual(y, 2 * x)
+
+    def test_inference_mode_outside_vjp(self, device):
+        x = torch.randn(3, device=device)
+        with torch.inference_mode():
+            out, vjp_fn = vjp(lambda x: (x**2).sum(), x)
+            (y,) = vjp_fn(torch.tensor(1.0, device=device))
+        self.assertEqual(y, 2 * x)
+
+    def test_inference_mode_outside_jvp(self, device):
+        x = torch.randn(3, device=device)
+        t = torch.ones(3, device=device)
+        with torch.inference_mode():
+            out, tangent = jvp(lambda x: x**2, (x,), (t,))
+        self.assertEqual(out, x**2)
+        self.assertEqual(tangent, 2 * x)
+
+    def test_inference_mode_outside_jacrev(self, device):
+        x = torch.randn(3, device=device)
+        with torch.inference_mode():
+            J = jacrev(lambda x: x**2)(x)
+        self.assertEqual(J, torch.diag(2 * x))
+
+    def test_inference_mode_outside_grad_vmap(self, device):
+        x = torch.randn(3, device=device)
+        with torch.inference_mode():
+            y = grad(lambda x: vmap(torch.square)(x).sum())(x)
+        self.assertEqual(y, 2 * x)
+
+    def test_inference_mode_outside_vmap_grad(self, device):
+        xs = torch.randn(4, 3, device=device)
+        with torch.inference_mode():
+            ys = vmap(grad(lambda x: (x**2).sum()))(xs)
+        self.assertEqual(ys, 2 * xs)
+
+    @skipIfTorchDynamo("compile test")
+    def test_inference_mode_outside_grad_compiled(self, device):
+        @torch.compile(backend="eager", fullgraph=True)
+        def f(x):
+            return grad(lambda x: (x**2).sum())(x)
+
+        x = torch.randn(3, device=device)
+        with torch.inference_mode():
+            y = f(x)
+        self.assertEqual(y, 2 * x)
+
+    @skipIfTorchDynamo("internal API test")
+    def test_pop_dynamic_layer_stack_to_depth_grad(self, device):
+        # popDynamicLayerStackToDepth is used by Dynamo for error-recovery
+        # cleanup. Verify it handles a single Grad layer without crashing
+        # and restores inference_mode.
+        ft = torch._C._functorch
+        with torch.inference_mode():
+            ft._grad_increment_nesting()
+            self.assertFalse(torch.is_inference_mode_enabled())
+            ft.pop_dynamic_layer_stack_and_undo_to_depth(0)
+            self.assertTrue(torch.is_inference_mode_enabled())
+
+    @skipIfTorchDynamo("internal API test")
+    def test_pop_dynamic_layer_stack_to_depth_jvp(self, device):
+        ft = torch._C._functorch
+        with torch.inference_mode():
+            ft._jvp_increment_nesting()
+            self.assertFalse(torch.is_inference_mode_enabled())
+            ft.pop_dynamic_layer_stack_and_undo_to_depth(0)
+            self.assertTrue(torch.is_inference_mode_enabled())
+
+    @skipIfTorchDynamo("internal API test")
+    def test_pop_dynamic_layer_stack_to_depth_mixed(self, device):
+        ft = torch._C._functorch
+        with torch.inference_mode():
+            ft._vmap_increment_nesting(3, "error")
+            ft._grad_increment_nesting()
+            self.assertEqual(ft.get_dynamic_layer_stack_depth(), 2)
+            ft.pop_dynamic_layer_stack_and_undo_to_depth(0)
+            self.assertEqual(ft.get_dynamic_layer_stack_depth(), 0)
+            self.assertTrue(torch.is_inference_mode_enabled())
+
+    @skipIfTorchDynamo("internal API test")
+    def test_pop_dynamic_layer_stack_to_depth_partial(self, device):
+        # Partial unwind: pop only the top layers, verify inference_mode
+        # is restored when the layer that disabled it is popped.
+        ft = torch._C._functorch
+        with torch.inference_mode():
+            ft._vmap_increment_nesting(3, "error")
+            ft._grad_increment_nesting()  # disables inference_mode
+            ft._jvp_increment_nesting()  # inference_mode already off
+            self.assertEqual(ft.get_dynamic_layer_stack_depth(), 3)
+            # Pop jvp and grad, keep vmap
+            ft.pop_dynamic_layer_stack_and_undo_to_depth(1)
+            self.assertEqual(ft.get_dynamic_layer_stack_depth(), 1)
+            self.assertTrue(torch.is_inference_mode_enabled())
+            ft.pop_dynamic_layer_stack_and_undo_to_depth(0)
+
+    def test_inference_mode_md_workflow(self, device):
+        # Molecular dynamics pattern: compute forces = -grad(potential) on
+        # positions, with a frozen neural network potential under inference_mode.
+        # This exercises: nn.Module with no-grad params, nonlinear ops,
+        # repeated grad calls in a loop, and tensors created under inference_mode.
+        potential = torch.nn.Sequential(
+            torch.nn.Linear(3, 16, bias=False),
+            torch.nn.Tanh(),
+            torch.nn.Linear(16, 1, bias=False),
+        ).to(device)
+        potential.requires_grad_(False)
+
+        def compute_forces(positions):
+            energy_fn = lambda r: potential(r).sum()
+            return -grad(energy_fn)(positions)
+
+        positions = torch.randn(8, 3, device=device)
+        forces_ref = compute_forces(positions)
+
+        with torch.inference_mode():
+            for i in range(3):
+                forces = compute_forces(positions)
+                if i == 0:
+                    # First iteration uses same positions — must match reference
+                    self.assertEqual(forces, forces_ref)
+                positions = positions + 0.01 * forces
+
+            self.assertTrue(torch.is_inference_mode_enabled())
+
+    def test_inference_mode_inside_grad(self, device):
+        # inference_mode *inside* the function being differentiated should be
+        # respected: ops under it don't contribute gradients, mirroring no_grad.
+        def f(x):
+            with torch.inference_mode():
+                c = x**2  # detached from the grad graph
+            return x - c  # grad is 1, not 1 - 2x
+
+        x = torch.randn(3, device=device)
+        with torch.inference_mode():
+            y = grad(lambda x: f(x).sum())(x)
+        self.assertEqual(y, torch.ones_like(x))
+
+    def test_inference_mode_nested_grad(self, device):
+        # Nested differentiation: hessian = grad(grad(f)).
+        # Tests the nesting invariant: only the outermost layer records
+        # prevInferenceMode_=true; inner layers see it already off.
+        x = torch.randn([], device=device)
+        with torch.inference_mode():
+            # f(x) = x^3, f'(x) = 3x^2, f''(x) = 6x
+            hess = grad(grad(lambda x: x**3))(x)
+        self.assertEqual(hess, 6 * x)
+
+    def test_inference_mode_md_with_hessian(self, device):
+        # Molecular dynamics with Hessian: compute forces and force constants
+        # from a neural network potential under inference_mode.
+        # In MD, forces = -grad(V) and the Hessian d²V/dr² gives vibrational
+        # frequencies and is used for geometry optimization (e.g., Newton-Raphson).
+        potential = torch.nn.Sequential(
+            torch.nn.Linear(3, 16, bias=False),
+            torch.nn.Tanh(),
+            torch.nn.Linear(16, 1, bias=False),
+        ).to(device)
+        potential.requires_grad_(False)
+
+        def energy(r):
+            return potential(r).squeeze()
+
+        positions = torch.randn(3, device=device)
+        # Reference values computed outside inference_mode
+        forces_ref = -grad(energy)(positions)
+        # hessian() uses jacfwd(jacrev(...)), the recommended forward-over-reverse
+        hessian_ref = hessian(energy)(positions)
+
+        with torch.inference_mode():
+            forces = -grad(energy)(positions)
+            H = hessian(energy)(positions)
+
+        self.assertEqual(forces, forces_ref)
+        self.assertEqual(H, hessian_ref)
+        # Hessian of a smooth potential must be symmetric
+        self.assertEqual(H, H.T)
+
+    def test_inference_mode_vmap_grad_batched_forces(self, device):
+        # Batched force computation: vmap(grad(potential)) over a batch of
+        # particle configurations — common in ML potentials.
+        potential = torch.nn.Sequential(
+            torch.nn.Linear(3, 8, bias=False),
+            torch.nn.Tanh(),
+            torch.nn.Linear(8, 1, bias=False),
+        ).to(device)
+        potential.requires_grad_(False)
+
+        batch_positions = torch.randn(5, 3, device=device)
+
+        with torch.inference_mode():
+            forces = vmap(grad(lambda r: -potential(r).squeeze()))(batch_positions)
+        self.assertEqual(forces.shape, batch_positions.shape)
+        self.assertFalse(torch.all(forces == 0))
+
+        # Compare against non-inference-mode
+        forces_ref = vmap(grad(lambda r: -potential(r).squeeze()))(batch_positions)
+        self.assertEqual(forces, forces_ref)
+
 
 @markDynamoStrictTest
 class TestAutogradFunction(TestCase):
