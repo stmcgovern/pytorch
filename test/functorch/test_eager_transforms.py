@@ -1320,12 +1320,11 @@ class TestGradTransform(TestCase):
         positions = torch.randn(3, device=device)
         # Reference values computed outside inference_mode
         forces_ref = -grad(energy)(positions)
-        # hessian() uses jacfwd(jacrev(...)), the recommended forward-over-reverse
-        hessian_ref = hessian(energy)(positions)
+        hessian_ref = jacrev(grad(energy))(positions)
 
         with torch.inference_mode():
             forces = -grad(energy)(positions)
-            H = hessian(energy)(positions)
+            H = jacrev(grad(energy))(positions)
 
         self.assertEqual(forces, forces_ref)
         self.assertEqual(H, hessian_ref)

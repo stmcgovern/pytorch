@@ -442,13 +442,17 @@ def _vjp_with_argnums(
                     f"cotangents: {treespec_pprint(cotangents_spec)}, "
                     f"primal output: {treespec_pprint(primals_out_spec)}"
                 )
-            result = _autograd_grad(
-                flat_primals_out,
-                flat_diff_primals,
-                flat_cotangents,
-                retain_graph=retain_graph,
-                create_graph=create_graph,
-            )
+            # The forward graph was built with inference_mode off (disabled by
+            # grad_increment_nesting). The backward must also run with it off,
+            # since the autograd engine can't operate on inference tensors.
+            with torch.inference_mode(False):
+                result = _autograd_grad(
+                    flat_primals_out,
+                    flat_diff_primals,
+                    flat_cotangents,
+                    retain_graph=retain_graph,
+                    create_graph=create_graph,
+                )
             return tree_unflatten(result, primals_spec)
 
     if has_aux:
