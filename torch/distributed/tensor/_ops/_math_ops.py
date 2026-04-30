@@ -1808,8 +1808,8 @@ def _adjust_group_norm_scalars(
 # Normalization ops
 #
 # Batch norm reduces over batch (dim 0) + spatial dims (2+), keeping only
-# channel (dim 1).  Neither batch nor channel sharding is safe, so we fall
-# back to replicate-only.
+# channel (dim 1).  Channel-dim sharding is safe: each shard processes
+# independent channels with their own statistics.
 #
 # Group norm reduces over (C/groups, spatial) within each group per sample.
 # Batch dim (0) is safe to shard — each sample is independent.
@@ -1853,6 +1853,33 @@ def batch_norm_strategy(
 
 
 @register_single_dim_strategy(
+    [aten.native_batch_norm_backward.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def batch_norm_backward_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # native_batch_norm_backward(grad_out, input, weight?, running_mean?,
+    #   running_var?, save_mean?, save_invstd?, train, eps, output_mask)
+    #   -> (grad_input, grad_weight, grad_bias)
+    # Channel-dim sharding: grad_out/input [N,C,*] on dim 1,
+    # all 1D params [C] on dim 0, outputs grad_input on dim 1,
+    # grad_weight/grad_bias [C] on dim 0.
+    num_tensor_inputs = sum(isinstance(a, TensorMeta) for a in args_schema)
+    rule: list[Placement | _ShardingPlaceholder] = [
+        _ShardingPlaceholder(1),  # grad_input [N,C,*]
+        _ShardingPlaceholder(0),  # grad_weight [C]
+        _ShardingPlaceholder(0),  # grad_bias [C]
+        _ShardingPlaceholder(1),  # grad_out [N,C,*]
+        _ShardingPlaceholder(1),  # input [N,C,*]
+    ]
+    rule.extend([_ShardingPlaceholder(0)] * (num_tensor_inputs - 2))
+    return [rule]
+
+
+@register_single_dim_strategy(
     [aten.native_group_norm.default],
     schema_info=RuntimeSchemaInfo(1),
 )
@@ -1880,3 +1907,60 @@ from torch.distributed.tensor._api import DTensor
 DTensor._op_dispatcher.sharding_propagator.op_to_scalar_shape_adjuster[
     aten.native_group_norm.default
 ] = _adjust_group_norm_scalars
+
+
+@register_single_dim_strategy(
+    [aten.native_group_norm_backward.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def group_norm_backward_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # native_group_norm_backward(grad_out, input, mean, rstd, weight?,
+    #   N, C, HxW, group, output_mask) -> (grad_input, grad_weight, grad_bias)
+    # Batch dim (0) is independent. grad_weight/grad_bias are Partial because
+    # they reduce over the batch dimension.
+    num_tensor_inputs = sum(isinstance(a, TensorMeta) for a in args_schema)
+    rule: list[Placement | _ShardingPlaceholder] = [
+        _ShardingPlaceholder(0),  # grad_input [N,C,*]
+        Partial(),                # grad_weight [C] — reduce over batch
+        Partial(),                # grad_bias [C] — reduce over batch
+        _ShardingPlaceholder(0),  # grad_out [N,C,*]
+        _ShardingPlaceholder(0),  # input [N,C,*]
+        _ShardingPlaceholder(0),  # mean [N, groups]
+        _ShardingPlaceholder(0),  # rstd [N, groups]
+    ]
+    # weight (if present) must be Replicate
+    if num_tensor_inputs > 4:
+        rule.append(Replicate())
+    return [rule]
+
+
+def _adjust_group_norm_backward_scalars(
+    input_specs: list[DTensorSpec], schema: OpSchema
+) -> OpSchema:
+    """Adjust N scalar arg in native_group_norm_backward to local value.
+
+    native_group_norm_backward(grad_out, input, mean, rstd, weight?, N, C, HxW, group, output_mask)
+    Only N (batch size) needs adjustment when batch-dim is sharded.
+    """
+    input_spec = input_specs[1]  # input tensor is at index 1
+    if input_spec.tensor_meta is None:
+        raise AssertionError("input_spec must have tensor_meta")
+    local_shape, _ = compute_local_shape_and_global_offset(
+        input_spec.tensor_meta.shape,
+        input_spec.mesh,
+        input_spec.placements,
+        skip_offset=True,
+    )
+    args = list(schema.args_schema)
+    num_tensor_args = sum(isinstance(a, DTensorSpec) for a in args)
+    args[num_tensor_args] = local_shape[0]  # N = local batch size
+    return OpSchema(schema.op, tuple(args), schema.kwargs_schema)
+
+
+DTensor._op_dispatcher.sharding_propagator.op_to_scalar_shape_adjuster[
+    aten.native_group_norm_backward.default
+] = _adjust_group_norm_backward_scalars

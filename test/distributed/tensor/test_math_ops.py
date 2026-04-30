@@ -1772,6 +1772,71 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     @skip_unless_torch_gpu
+    def test_batch_norm_backward(self):
+        device_mesh = self.build_device_mesh()
+        F = torch.nn.functional
+
+        N, C, H, W = 8, 6, 4, 4
+        inp = torch.randn(N, C, H, W, device=self.device_type, requires_grad=True)
+        weight = torch.randn(C, device=self.device_type, requires_grad=True)
+        bias = torch.randn(C, device=self.device_type, requires_grad=True)
+
+        # Channel-dim sharding for batch norm backward
+        dt_inp = distribute_tensor(
+            inp.detach().clone().requires_grad_(True), device_mesh, [Shard(1)]
+        )
+        dt_weight = distribute_tensor(
+            weight.detach().clone().requires_grad_(True), device_mesh, [Shard(0)]
+        )
+        dt_bias = distribute_tensor(
+            bias.detach().clone().requires_grad_(True), device_mesh, [Shard(0)]
+        )
+
+        # Forward + backward (training mode, no running stats)
+        out = F.batch_norm(inp, None, None, weight, bias, training=True)
+        out.sum().backward()
+        dt_out = F.batch_norm(dt_inp, None, None, dt_weight, dt_bias, training=True)
+        dt_out.sum().backward()
+
+        self.assertEqual(dt_inp.grad.full_tensor(), inp.grad)
+        self.assertEqual(dt_weight.grad.full_tensor(), weight.grad)
+        self.assertEqual(dt_bias.grad.full_tensor(), bias.grad)
+
+    @with_comms
+    @skip_unless_torch_gpu
+    def test_group_norm_backward(self):
+        device_mesh = self.build_device_mesh()
+        F = torch.nn.functional
+
+        N, C, H, W = 8, 6, 4, 4
+        num_groups = 3
+        inp = torch.randn(N, C, H, W, device=self.device_type, requires_grad=True)
+        weight = torch.randn(C, device=self.device_type, requires_grad=True)
+        bias = torch.randn(C, device=self.device_type, requires_grad=True)
+
+        # Batch-dim sharding for group norm backward
+        dt_inp = distribute_tensor(
+            inp.detach().clone().requires_grad_(True), device_mesh, [Shard(0)]
+        )
+        dt_weight = distribute_tensor(
+            weight.detach().clone().requires_grad_(True), device_mesh, [Replicate()]
+        )
+        dt_bias = distribute_tensor(
+            bias.detach().clone().requires_grad_(True), device_mesh, [Replicate()]
+        )
+
+        # Forward + backward
+        out = F.group_norm(inp, num_groups, weight, bias)
+        out.sum().backward()
+        dt_out = F.group_norm(dt_inp, num_groups, dt_weight, dt_bias)
+        dt_out.sum().backward()
+
+        self.assertEqual(dt_inp.grad.full_tensor(), inp.grad)
+        self.assertEqual(dt_weight.grad.full_tensor(), weight.grad)
+        self.assertEqual(dt_bias.grad.full_tensor(), bias.grad)
+
+    @with_comms
+    @skip_unless_torch_gpu
     def test_linalg_batch_sharding(self):
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         A = torch.randn(8, 4, 4, device=self.device_type, dtype=torch.float64)
