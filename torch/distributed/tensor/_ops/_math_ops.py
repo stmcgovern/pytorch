@@ -732,24 +732,19 @@ def foreach_max_strategy(op_schema: OpSchema) -> TupleStrategy:
 
 @register_op_strategy(
     [
-        aten._linalg_svd.default,
-        aten.linalg_qr.default,
         # TODO: The diagonal ops can have an improved sharding strategy for
         # shard placements that does not require redistributing to replicate.
         aten.diagonal_copy.default,
         aten.diag_embed.default,
         aten.diag.default,
         aten.diagonal.default,
-        aten.tril.default,
-        aten.triu.default,
-        aten._linalg_eigh.default,
     ],
     schema_info=RuntimeSchemaInfo(1),
 )
 def linalg_replicate_strategy(op_schema: OpSchema) -> OpStrategy:
     """
-    Since we do not have a simple way to compute some linear algebra operations
-    like SVD or QR decomposition, always fall back to replicate.
+    Diagonal ops do not yet have sharding strategies that avoid
+    redistributing to replicate. Fall back to replicate for now.
     """
     args_schema = op_schema.args_schema
     input_strategy = args_schema[0]
@@ -1461,6 +1456,8 @@ _LINALG_NUM_PLACEMENTS = {
     aten.cholesky.default: 2,
     aten.cholesky_inverse.default: 2,
     aten.linalg_matrix_exp.default: 2,
+    aten.tril.default: 2,
+    aten.triu.default: 2,
     # 2 in 1 out
     aten.cholesky_solve.default: 3,
     aten.linalg_householder_product.default: 3,
@@ -1474,9 +1471,12 @@ _LINALG_NUM_PLACEMENTS = {
     aten.linalg_cholesky_ex.default: 3,
     aten.linalg_eig.default: 3,
     aten.linalg_inv_ex.default: 3,
+    aten.linalg_qr.default: 3,
+    aten._linalg_eigh.default: 3,
     # 2 in 2 out
     aten.triangular_solve.default: 4,
     # 1 in 3 out
+    aten._linalg_svd.default: 4,
     aten._linalg_det.default: 4,
     aten.linalg_ldl_factor_ex.default: 4,
     aten.linalg_lu.default: 4,
@@ -1536,6 +1536,11 @@ def _get_ndim(tensor_meta: Any) -> int:
         aten._linalg_slogdet.default,
         aten._linalg_solve_ex.default,
         aten._linalg_check_errors.default,
+        aten._linalg_svd.default,
+        aten.linalg_qr.default,
+        aten._linalg_eigh.default,
+        aten.tril.default,
+        aten.triu.default,
     ],
     schema_info=RuntimeSchemaInfo(1),
 )

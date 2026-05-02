@@ -1770,6 +1770,55 @@ class DistMathOpsTest(DTensorTestBase):
         self.assertEqual(result.full_tensor(), expected)
         self.assertTrue(result.placements[0].is_shard(0))
 
+    @with_comms
+    @skip_unless_torch_gpu
+    def test_linalg_batch_sharding(self):
+        device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
+        A = torch.randn(8, 4, 4, device=self.device_type, dtype=torch.float64)
+        dt_A = distribute_tensor(A, device_mesh, [Shard(0)])
+
+        # SVD
+        exp_U, exp_S, exp_Vh = torch.linalg.svd(A)
+        res_U, res_S, res_Vh = torch.linalg.svd(dt_A)
+        self.assertEqual(res_U.full_tensor(), exp_U)
+        self.assertEqual(res_S.full_tensor(), exp_S)
+        self.assertEqual(res_Vh.full_tensor(), exp_Vh)
+        self.assertTrue(res_U.placements[0].is_shard(0))
+
+        # QR
+        exp_Q, exp_R = torch.linalg.qr(A)
+        res_Q, res_R = torch.linalg.qr(dt_A)
+        self.assertEqual(res_Q.full_tensor(), exp_Q)
+        self.assertEqual(res_R.full_tensor(), exp_R)
+        self.assertTrue(res_Q.placements[0].is_shard(0))
+
+        # eigh (needs symmetric input)
+        sym = A @ A.mT + torch.eye(4, device=self.device_type, dtype=torch.float64)
+        dt_sym = distribute_tensor(sym, device_mesh, [Shard(0)])
+        exp_L, exp_V = torch.linalg.eigh(dt_sym.full_tensor())
+        res_L, res_V = torch.linalg.eigh(dt_sym)
+        self.assertEqual(res_L.full_tensor(), exp_L)
+        self.assertEqual(res_V.full_tensor(), exp_V)
+        self.assertTrue(res_L.placements[0].is_shard(0))
+
+    @with_comms
+    @skip_unless_torch_gpu
+    def test_tril_triu_batch_sharding(self):
+        device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
+        A = torch.randn(8, 4, 4, device=self.device_type)
+        dt_A = distribute_tensor(A, device_mesh, [Shard(0)])
+
+        for op in (torch.tril, torch.triu):
+            expected = op(A)
+            result = op(dt_A)
+            self.assertEqual(result.full_tensor(), expected)
+            self.assertTrue(result.placements[0].is_shard(0))
+
+            expected_d1 = op(A, diagonal=1)
+            result_d1 = op(dt_A, diagonal=1)
+            self.assertEqual(result_d1.full_tensor(), expected_d1)
+            self.assertTrue(result_d1.placements[0].is_shard(0))
+
 
 DistMathOpsTestWithLocalTensor = create_local_tensor_test_class(
     DistMathOpsTest,
