@@ -1131,6 +1131,47 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             )
             self.assertEqual(output_dt.full_tensor(), ref)
 
+    @with_comms
+    def test_unsafe_index_ops(self):
+        # Standard single-dim strategy test: value correctness, zero comms,
+        # and output placement preservation.
+        device_mesh = init_device_mesh(self.device_type, (self.world_size,))
+        comm_mode = CommDebugMode()
+
+        # _unsafe_index: shard on non-indexed dim (dim 1), index into dim 0
+        x = torch.randn(8, 6, 4, device=self.device_type)
+        idx = torch.tensor([0, 2], device=self.device_type)
+        dt_x = distribute_tensor(x, device_mesh, [Shard(1)])
+        dt_idx = distribute_tensor(idx, device_mesh, [Replicate()])
+        ref = torch.ops.aten.index.Tensor(x, [idx])
+        with comm_mode:
+            result = torch.ops.aten._unsafe_index.Tensor(dt_x, [dt_idx])
+        self.assertEqual(comm_mode.get_total_counts(), 0)
+        self.assertEqual(result.placements, (Shard(1),))
+        self.assertEqual(result.full_tensor(), ref)
+
+        # _unsafe_index_put: shard on non-indexed dim
+        values = torch.randn(2, 6, 4, device=self.device_type)
+        dt_values = distribute_tensor(values, device_mesh, [Replicate()])
+        ref_put = torch.ops.aten.index_put.default(x, [idx], values)
+        with comm_mode:
+            result_put = torch.ops.aten._unsafe_index_put.default(
+                dt_x, [dt_idx], dt_values
+            )
+        self.assertEqual(comm_mode.get_total_counts(), 0)
+        self.assertEqual(result_put.placements, (Shard(1),))
+        self.assertEqual(result_put.full_tensor(), ref_put)
+
+        # _unsafe_index_put with accumulate=True
+        ref_acc = torch.ops.aten.index_put.default(x, [idx], values, True)
+        with comm_mode:
+            result_acc = torch.ops.aten._unsafe_index_put.default(
+                dt_x, [dt_idx], dt_values, True
+            )
+        self.assertEqual(comm_mode.get_total_counts(), 0)
+        self.assertEqual(result_acc.placements, (Shard(1),))
+        self.assertEqual(result_acc.full_tensor(), ref_acc)
+
     def test_where_type_promotion(self):
         mesh = self.build_device_mesh()  # 1D mesh
 

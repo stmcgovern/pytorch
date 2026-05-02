@@ -1069,7 +1069,8 @@ def index_select_single_dim_strategy(
 
 
 @register_single_dim_strategy(
-    aten.index.Tensor, schema_info=RuntimeSchemaInfo(needs_pytree=True)
+    [aten.index.Tensor, aten._unsafe_index.Tensor],
+    schema_info=RuntimeSchemaInfo(needs_pytree=True),
 )
 def index_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
@@ -1150,7 +1151,12 @@ def index_single_dim_strategy(
 
 
 @register_single_dim_strategy(
-    [aten.index_put.default, aten.index_put_.default, aten._index_put_impl_.default],
+    [
+        aten.index_put.default,
+        aten.index_put_.default,
+        aten._index_put_impl_.default,
+        aten._unsafe_index_put.default,
+    ],
     schema_info=RuntimeSchemaInfo(needs_pytree=True),
 )
 def index_put_single_dim_strategy(
