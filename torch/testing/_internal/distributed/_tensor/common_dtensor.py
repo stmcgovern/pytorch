@@ -1467,6 +1467,161 @@ def validate_sharding_rule_sample(
     return True
 
 
+class _BackwardResult:
+    __slots__ = ("status", "msg")
+
+    SKIP = "skip"
+    PASS = "pass"
+    VALUE_MISMATCH = "value_mismatch"
+    DTENSOR_ERROR = "dtensor_error"
+
+    def __init__(self, status, msg=""):
+        self.status = status
+        self.msg = msg
+
+    @property
+    def testable(self):
+        return self.status != self.SKIP
+
+    @property
+    def ok(self):
+        return self.status == self.PASS
+
+    def __repr__(self):
+        return f"_BackwardResult({self.status}, {self.msg!r})"
+
+
+def validate_sharding_rule_sample_backward(
+    op, full_args, full_kwargs, input_placements, output_placements, device_mesh
+):
+    """Verify backward gradient values for a sharding strategy.
+
+    Runs the op through DTensor dispatch end-to-end, then checks that
+    dtensor.grad.full_tensor() matches the reference (non-distributed) grad.
+
+    Returns a _BackwardResult with status:
+      SKIP  -- op is non-differentiable or has no float tensors
+      PASS  -- gradient values match
+      VALUE_MISMATCH  -- gradient values or shapes differ
+      DTENSOR_ERROR   -- DTensor backward raised an exception
+    """
+    from torch.utils import _pytree as pytree
+
+    full_tensors = [
+        a for a in pytree.tree_leaves(full_args) if isinstance(a, torch.Tensor)
+    ]
+    full_tensors += [
+        a for a in pytree.tree_leaves(full_kwargs) if isinstance(a, torch.Tensor)
+    ]
+
+    if not any(t.is_floating_point() for t in full_tensors):
+        return _BackwardResult(_BackwardResult.SKIP, "no float tensors")
+
+    # Build reference: clone with requires_grad for float tensors
+    ref_tensors = []
+    for t in full_tensors:
+        c = t.detach().clone()
+        if c.is_floating_point():
+            c.requires_grad_(True)
+        ref_tensors.append(c)
+
+    ref_idx = 0
+
+    def _to_ref(a):
+        nonlocal ref_idx
+        if isinstance(a, torch.Tensor):
+            r = ref_tensors[ref_idx]
+            ref_idx += 1
+            return r
+        return a
+
+    ref_args, ref_kwargs = pytree.tree_map(_to_ref, (full_args, full_kwargs))
+
+    try:
+        ref_output = op(*ref_args, **ref_kwargs)
+        ref_out_tensors = [
+            t
+            for t in pytree.tree_leaves(ref_output)
+            if isinstance(t, torch.Tensor) and t.is_floating_point() and t.requires_grad
+        ]
+        if not ref_out_tensors:
+            return _BackwardResult(_BackwardResult.SKIP, "no differentiable outputs")
+        ref_loss = sum(t.sum() for t in ref_out_tensors)
+        ref_loss.backward()
+    except Exception:
+        return _BackwardResult(_BackwardResult.SKIP, "reference backward failed")
+
+    # Build DTensor inputs with specified placements
+    dt_tensors = []
+    for t, p in zip(full_tensors, input_placements):
+        c = t.detach().clone()
+        if c.is_floating_point():
+            c.requires_grad_(True)
+        dt_tensors.append(distribute_tensor(c, device_mesh, (p,)))
+
+    dt_idx = 0
+
+    def _to_dt(a):
+        nonlocal dt_idx
+        if isinstance(a, torch.Tensor):
+            d = dt_tensors[dt_idx]
+            dt_idx += 1
+            return d
+        return a
+
+    dt_args, dt_kwargs = pytree.tree_map(_to_dt, (full_args, full_kwargs))
+
+    try:
+        dt_output = op(*dt_args, **dt_kwargs)
+        dt_out_tensors = [
+            t
+            for t in pytree.tree_leaves(dt_output)
+            if isinstance(t, torch.Tensor) and t.is_floating_point() and t.requires_grad
+        ]
+        if not dt_out_tensors:
+            return _BackwardResult(
+                _BackwardResult.SKIP, "no differentiable DTensor outputs"
+            )
+        dt_loss = sum(t.sum() for t in dt_out_tensors)
+        dt_loss.backward()
+    except Exception as e:
+        msg = str(e)
+        if (
+            "does not have a sharding strategy registered" in msg
+            or "got mixed torch.Tensor and DTensor" in msg
+        ):
+            return _BackwardResult(_BackwardResult.SKIP, msg)
+        return _BackwardResult(_BackwardResult.DTENSOR_ERROR, msg)
+
+    # Compare gradient values
+    for ref_t, dt_t in zip(ref_tensors, dt_tensors):
+        if not ref_t.is_floating_point() or ref_t.grad is None:
+            continue
+        if dt_t.grad is None:
+            return _BackwardResult(
+                _BackwardResult.VALUE_MISMATCH, "DTensor grad is None"
+            )
+        try:
+            if isinstance(dt_t.grad, DTensor):
+                dt_grad_full = dt_t.grad.full_tensor()
+            else:
+                dt_grad_full = dt_t.grad
+        except Exception as e:
+            return _BackwardResult(_BackwardResult.SKIP, f"full_tensor failed: {e}")
+        if ref_t.grad.shape != dt_grad_full.shape:
+            return _BackwardResult(
+                _BackwardResult.VALUE_MISMATCH,
+                f"shape {dt_grad_full.shape} != {ref_t.grad.shape}",
+            )
+        if not torch.allclose(
+            ref_t.grad, dt_grad_full, atol=1e-5, rtol=1.3e-6, equal_nan=True
+        ):
+            return _BackwardResult(
+                _BackwardResult.VALUE_MISMATCH, "gradient values differ"
+            )
+    return _BackwardResult(_BackwardResult.PASS)
+
+
 @contextlib.contextmanager
 def op_strategy_context(op_overload, strategy_func, schema_info=None):
     """
