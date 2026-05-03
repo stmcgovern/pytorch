@@ -1815,12 +1815,42 @@ class DistMathOpsTest(DTensorTestBase):
         self.assertEqual(dt_w.grad.full_tensor(), ref_w.grad)
         self.assertEqual(dt_b.grad.full_tensor(), ref_b.grad)
 
-        # group_norm with batch-dim sharding — scalar N/C/HxW args are adjusted
+        # group_norm with batch-dim sharding — forward only (original test)
         num_groups = 3
         expected = F.group_norm(inp, num_groups, weight, bias)
         result = F.group_norm(dt_inp, num_groups, dt_weight, dt_bias)
         self.assertEqual(result.full_tensor(), expected)
         self.assertTrue(result.placements[0].is_shard(0))
+
+        # group_norm with batch-dim sharding — forward + backward
+        # N must be divisible by world_size for batch-dim sharding
+        N_g = self.world_size * 2
+        inp_g = torch.randn(N_g, C, H, W, device=self.device_type)
+
+        ref_inp_g = inp_g.clone().detach().requires_grad_(True)
+        ref_w_g = weight.clone().detach().requires_grad_(True)
+        ref_b_g = bias.clone().detach().requires_grad_(True)
+        dt_inp_g = distribute_tensor(
+            inp_g.clone().detach().requires_grad_(True), device_mesh, [Shard(0)]
+        )
+        dt_w_g = distribute_tensor(
+            weight.clone().detach().requires_grad_(True), device_mesh, replicate
+        )
+        dt_b_g = distribute_tensor(
+            bias.clone().detach().requires_grad_(True), device_mesh, replicate
+        )
+
+        expected_gn = F.group_norm(ref_inp_g, num_groups, ref_w_g, ref_b_g)
+        result_gn = F.group_norm(dt_inp_g, num_groups, dt_w_g, dt_b_g)
+        self.assertEqual(result_gn.full_tensor(), expected_gn)
+        self.assertTrue(result_gn.placements[0].is_shard(0))
+
+        expected_gn.sum().backward()
+        result_gn.sum().backward()
+        self.assertEqual(dt_inp_g.grad.full_tensor(), ref_inp_g.grad)
+        self.assertTrue(dt_inp_g.grad.placements[0].is_shard(0))
+        self.assertEqual(dt_w_g.grad.full_tensor(), ref_w_g.grad)
+        self.assertEqual(dt_b_g.grad.full_tensor(), ref_b_g.grad)
 
 
 DistMathOpsTestWithLocalTensor = create_local_tensor_test_class(
