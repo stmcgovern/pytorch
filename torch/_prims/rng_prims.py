@@ -323,7 +323,7 @@ run_with_rng_state = register_run_with_rng_state_op()
 def register_graphsafe_run_with_rng_state_op():
     class GraphSafeRunWithRngState(HigherOrderOperator):
         def __init__(self):
-            super().__init__("graphsafe_run_with_rng_state")
+            super().__init__("graphsafe_run_with_rng_state", cacheable=True)
 
         def __call__(self, op, *args, rng_state=None, **kwargs):
             # pyrefly: ignore [missing-attribute]
