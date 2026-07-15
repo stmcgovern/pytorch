@@ -520,5 +520,112 @@ class TestMessages(TestCase):
             csan.cuda_sanitizer.disable()
 
 
+class TestNCCLStreamResolution(TestCase):
+    """Tests for correct NCCL stream attribution in c10d collectives."""
+
+    def test_extract_async_op_from_positional(self):
+        schema = torch.ops.c10d.allreduce_.default._schema
+        async_op_idx = None
+        for i, arg in enumerate(schema.arguments):
+            if arg.name == "async_op":
+                async_op_idx = i
+                break
+        self.assertIsNotNone(async_op_idx, "allreduce_ schema must have async_op")
+        args = [None] * (async_op_idx + 1)
+        args[async_op_idx] = False
+        result = csan.CUDASanitizerDispatchMode._extract_async_op(
+            schema, tuple(args), {}
+        )
+        self.assertFalse(result)
+
+    def test_extract_async_op_from_kwargs(self):
+        schema = torch.ops.c10d.allreduce_.default._schema
+        result = csan.CUDASanitizerDispatchMode._extract_async_op(
+            schema, (), {"async_op": False}
+        )
+        self.assertFalse(result)
+
+    def test_extract_async_op_default_is_true(self):
+        schema = torch.ops.c10d.allreduce_.default._schema
+        result = csan.CUDASanitizerDispatchMode._extract_async_op(schema, (), {})
+        self.assertTrue(result)
+
+    def test_non_c10d_op_is_not_async_collective(self):
+        mode = csan.CUDASanitizerDispatchMode()
+        schema = torch.ops.aten.add.Tensor._schema
+        self.assertFalse(mode._is_async_nccl_collective(schema, (), {}))
+
+    def test_c10d_barrier_is_not_async_collective(self):
+        mode = csan.CUDASanitizerDispatchMode()
+        schema = torch.ops.c10d.barrier.default._schema
+        self.assertFalse(mode._is_async_nccl_collective(schema, (), {}))
+
+    def test_c10d_sync_op_is_not_async_collective(self):
+        mode = csan.CUDASanitizerDispatchMode()
+        schema = torch.ops.c10d.allreduce_.default._schema
+        async_op_idx = None
+        for i, arg in enumerate(schema.arguments):
+            if arg.name == "async_op":
+                async_op_idx = i
+                break
+        args = [None] * (async_op_idx + 1)
+        args[async_op_idx] = False
+        self.assertFalse(mode._is_async_nccl_collective(schema, tuple(args), {}))
+
+    def test_c10d_async_op_is_async_collective(self):
+        mode = csan.CUDASanitizerDispatchMode()
+        schema = torch.ops.c10d.allreduce_.default._schema
+        self.assertTrue(mode._is_async_nccl_collective(schema, (), {}))
+
+
+class TestCUDASanitizerEndToEnd(TestCase):
+    """End-to-end tests that run on real CUDA hardware.
+
+    The other test classes exercise the vector-clock logic with synthetic IDs.
+    These tests verify the full pipeline: real kernels on real streams, traced
+    by the GPU trace callbacks, analyzed by EventHandler, reported through the
+    context-manager accumulation API.
+    """
+
+    def test_catches_cross_stream_race(self):
+        with csan.cuda_sanitizer as san:
+            s1 = torch.cuda.Stream()
+            t = torch.zeros(1024, device="cuda")
+            with torch.cuda.stream(s1):
+                t.fill_(1.0)
+            # No sync -- reading on default stream is a race
+            _ = t.sum()
+        self.assertGreater(len(san.errors), 0)
+
+    def test_no_false_positive_with_sync(self):
+        with csan.cuda_sanitizer as san:
+            s1 = torch.cuda.Stream()
+            t = torch.zeros(1024, device="cuda")
+            s1.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s1):
+                t.fill_(1.0)
+            torch.cuda.current_stream().wait_stream(s1)
+            _ = t.sum()
+        self.assertEqual(len(san.errors), 0)
+
+    def test_context_manager_reuse(self):
+        for i in range(3):
+            with csan.cuda_sanitizer as san:
+                t = torch.zeros(64, device="cuda")
+                _ = t.sum()
+            self.assertEqual(len(san.errors), 0, f"Unexpected error on iteration {i}")
+
+    def test_accumulates_multiple_errors(self):
+        with csan.cuda_sanitizer as san:
+            for _ in range(3):
+                s1 = torch.cuda.Stream()
+                t = torch.zeros(256, device="cuda")
+                with torch.cuda.stream(s1):
+                    t.fill_(1.0)
+                _ = t.sum()
+                torch.cuda.synchronize()
+        self.assertGreaterEqual(len(san.errors), 3)
+
+
 if __name__ == "__main__":
     run_tests()

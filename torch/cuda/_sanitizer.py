@@ -349,6 +349,9 @@ class EventHandler:
         self.syncs = StreamSynchronizations()
         self.seq_num: SeqNum = 0
 
+    def reset(self) -> None:
+        self.__init__()
+
     def _handle_kernel_launch(
         self,
         stream: StreamId,
@@ -559,6 +562,8 @@ class ArgumentHandler:
 class CUDASanitizerDispatchMode(TorchDispatchMode):
     def __init__(self) -> None:
         self.event_handler = EventHandler()
+        self.accumulated_errors: list[SynchronizationError] = []
+        self.accumulate: bool = False
         torch._C._activate_gpu_trace()
         gpu_trace.register_callback_for_event_creation(
             self.event_handler._handle_event_creation
@@ -595,7 +600,6 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
         if kwargs is None:
             kwargs = {}
 
-        # record_stream is not a kernel dispatch, skip it
         if func is aten.record_stream.default:
             return func(*args, **kwargs)
 
@@ -604,9 +608,13 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
         argument_handler = ArgumentHandler()
         argument_handler.parse_inputs(func._schema, args, kwargs, is_factory=is_factory)
 
+        if self._is_async_nccl_collective(func._schema, args, kwargs):
+            return self._dispatch_async_collective(func, argument_handler, args, kwargs)
+
         outputs = func(*args, **kwargs)
 
         argument_handler.parse_outputs(func._schema, outputs, is_factory=is_factory)
+
         errors = self.event_handler._handle_kernel_launch(
             torch.cuda.current_stream().cuda_stream,
             argument_handler.dataptrs_read - argument_handler.dataptrs_written,
@@ -616,11 +624,70 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
             argument_handler.tensor_aliases,
         )
         if errors:
-            for error in errors:
-                print(error, file=sys.stderr)
-            raise CUDASanitizerErrors(errors)
+            if self.accumulate:
+                self.accumulated_errors.extend(errors)
+            else:
+                for error in errors:
+                    print(error, file=sys.stderr)
+                raise CUDASanitizerErrors(errors)
 
         return outputs
+
+    def _dispatch_async_collective(self, func, argument_handler, args, kwargs):
+        """Handle async NCCL collectives with correct stream attribution.
+
+        Two fixes vs. the default path:
+
+        1. **Access ordering**: record BEFORE func so the access seq_num
+           is captured by ncclStartEvent (recorded on currentStream inside
+           ProcessGroupNCCL) and propagated through ncclEndEvent.  Recording
+           AFTER func gives a seq_num past ncclEndEvent's snapshot, so
+           work.wait() can't cover it in the vector clock.
+
+        2. **Write classification**: c10d schemas lack alias_info, so
+           ArgumentHandler classifies tensor args as read-only.  Collectives
+           modify tensors in-place, so all tensor ptrs are treated as
+           read+write here.
+        """
+        all_ptrs = argument_handler.dataptrs_read | argument_handler.dataptrs_written
+        errors = self.event_handler._handle_kernel_launch(
+            torch.cuda.current_stream().cuda_stream,
+            set(),
+            all_ptrs,
+            set(),
+            func._schema,
+            argument_handler.tensor_aliases,
+        )
+        if errors:
+            if self.accumulate:
+                self.accumulated_errors.extend(errors)
+            else:
+                for error in errors:
+                    print(error, file=sys.stderr)
+                raise CUDASanitizerErrors(errors)
+
+        return func(*args, **kwargs)
+
+    def _is_async_nccl_collective(
+        self, schema: torch.FunctionSchema, args: tuple, kwargs: dict
+    ) -> bool:
+        schema_name = schema.name
+        if not schema_name.startswith("c10d::") or schema_name == "c10d::barrier":
+            return False
+        return self._extract_async_op(schema, args, kwargs)
+
+    @staticmethod
+    def _extract_async_op(
+        schema: torch.FunctionSchema,
+        args: tuple,
+        kwargs: dict,
+    ) -> bool:
+        for i, arg in enumerate(schema.arguments):
+            if arg.name == "async_op":
+                if i < len(args):
+                    return bool(args[i])
+                return bool(kwargs.get("async_op", True))
+        return True
 
 
 class CUDASanitizer:
@@ -630,6 +697,15 @@ class CUDASanitizer:
     context manager in the enable function/destructor, respectively. This is to
     explicitly set the lifetime of the dispatch mode object to that of the application.
     This approach was deemed more elegant than using the atexit module.
+
+    Can also be used as a context manager with error accumulation::
+
+        with cuda_sanitizer as san:
+            # ... training loop ...
+        assert len(san.errors) == 0
+
+    In context-manager mode the sanitizer collects all detected races instead of
+    raising on the first one, and automatically disables on exit.
     """
 
     def __init__(self) -> None:
@@ -643,6 +719,25 @@ class CUDASanitizer:
     def disable(self):
         self.dispatch.__exit__(None, None, None)
         self.enabled = False
+
+    @property
+    def errors(self) -> list[SynchronizationError]:
+        """Errors accumulated during context-manager usage."""
+        return self.dispatch.accumulated_errors
+
+    def __enter__(self):
+        self.dispatch.event_handler.reset()
+        self.dispatch.accumulated_errors.clear()
+        self.dispatch.accumulate = True
+        if not self.enabled:
+            self.enable()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.dispatch.accumulate = False
+        if self.enabled:
+            self.disable()
+        return False
 
     def __del__(self):
         # Since this object lifetime is linked to the `torch.cuda._sanitizer` python
@@ -665,6 +760,11 @@ def enable_cuda_sanitizer():
     sanitizer should be enabled at the very beginning of the program.
     """
     cuda_sanitizer.enable()
+
+
+def disable_cuda_sanitizer():
+    """Disable CUDA Sanitizer."""
+    cuda_sanitizer.disable()
 
 
 cuda_sanitizer = CUDASanitizer()

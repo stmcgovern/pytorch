@@ -523,6 +523,26 @@ requires_triton_ptxas_compat = unittest.skipIf(not torch.version.xpu
                                                and _get_torch_cuda_version() < TRITON_PTXAS_VERSION,
                                                "Requires CUDA {}.{} to match Tritons ptxas version".format(*TRITON_PTXAS_VERSION))
 
+def assert_stream_safe(test_case, fn, *, n_steps=4, msg=None):
+    """Run ``fn()`` under the CUDA sanitizer and assert zero stream races.
+
+    Uses the sanitizer's accumulate mode so all races across all steps are
+    collected before asserting.  A ``torch.cuda.synchronize()`` is inserted
+    after each step to drain GPU work before the next iteration.
+    """
+    import torch.cuda._sanitizer as csan
+
+    with csan.cuda_sanitizer as san:
+        for _ in range(n_steps):
+            fn()
+            torch.cuda.synchronize()
+    test_case.assertEqual(
+        len(san.errors),
+        0,
+        msg or f"CUDA sanitizer detected {len(san.errors)} stream race(s)",
+    )
+
+
 # Importing this module should NOT eagerly initialize CUDA
 if not CUDA_ALREADY_INITIALIZED_ON_IMPORT:
     if torch.cuda.is_initialized():
