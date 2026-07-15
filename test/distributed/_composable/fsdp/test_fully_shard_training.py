@@ -933,6 +933,38 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
             ac=False,
         )
 
+    @skip_if_lt_x_gpu(2)
+    def test_partial_group_chunked_loss_rs_output_race(self):
+        """Regression for the chunked-loss rs_output stream-ordering race
+        (PR #181218).
+
+        Widens the race window by injecting ``torch.cuda._sleep`` on the
+        post-reduce stream via monkey-patching ``_to_dtype_if_needed``.
+        Passes with the ``wait_event`` fix at ``post_backward`` exit;
+        fails deterministically on ROCm without it. On CUDA, ref-hold
+        on ``reduce_scatter_input`` closes the allocator-reuse vector
+        so this test passes regardless of the fix.
+        """
+        from unittest.mock import patch as mock_patch
+
+        import torch.distributed.fsdp._fully_shard._fsdp_collectives as col
+
+        orig = col._to_dtype_if_needed
+        sleep_cycles = 10**8
+
+        def patched(tensor, dtype):
+            result = orig(tensor, dtype)
+            torch.cuda._sleep(sleep_cycles)
+            return result
+
+        with mock_patch.object(col, "_to_dtype_if_needed", patched):
+            self._test_partial_group_forward_then_standalone(
+                reshard_after_forward=True,
+                weight_tying=False,
+                mp_policy_mode="none",
+                ac=False,
+            )
+
     def _test_partial_group_forward_then_standalone(
         self,
         reshard_after_forward: bool | int,
