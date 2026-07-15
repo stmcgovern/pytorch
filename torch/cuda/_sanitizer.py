@@ -20,6 +20,7 @@ import re
 import sys
 import textwrap
 import traceback
+from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -559,11 +560,22 @@ class ArgumentHandler:
             )
 
 
+@dataclass
+class _GraphProfile:
+    reads: set[int]
+    writes: set[int]
+
+
 class CUDASanitizerDispatchMode(TorchDispatchMode):
     def __init__(self) -> None:
         self.event_handler = EventHandler()
         self.accumulated_errors: list[SynchronizationError] = []
         self.accumulate: bool = False
+        self._graph_profiles: dict[int, _GraphProfile] = {}
+        self._capturing_graph: Any = None
+        self._capture_reads: set[int] = set()
+        self._capture_writes: set[int] = set()
+        self._graph_hooks_installed = False
         torch._C._activate_gpu_trace()
         gpu_trace.register_callback_for_event_creation(
             self.event_handler._handle_event_creation
@@ -631,6 +643,10 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
                     print(error, file=sys.stderr)
                 raise CUDASanitizerErrors(errors)
 
+        if self._capturing_graph is not None:
+            self._capture_reads |= argument_handler.dataptrs_read
+            self._capture_writes |= argument_handler.dataptrs_written
+
         return outputs
 
     def _dispatch_async_collective(self, func, argument_handler, args, kwargs):
@@ -689,6 +705,90 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
                 return bool(kwargs.get("async_op", True))
         return True
 
+    def _install_graph_hooks(self) -> None:
+        if self._graph_hooks_installed:
+            return
+        from torch.cuda.graphs import CUDAGraph
+
+        self._orig_capture_begin = CUDAGraph.capture_begin
+        self._orig_capture_end = CUDAGraph.capture_end
+        self._orig_replay = CUDAGraph.replay
+        self._orig_reset = CUDAGraph.reset
+
+        mode = self
+
+        @functools.wraps(CUDAGraph.capture_begin)
+        def patched_capture_begin(self, *args, **kwargs):  # pyrefly: ignore
+            mode._on_capture_begin(self)
+            return mode._orig_capture_begin(self, *args, **kwargs)
+
+        @functools.wraps(CUDAGraph.capture_end)
+        def patched_capture_end(self):  # pyrefly: ignore
+            mode._orig_capture_end(self)
+            mode._on_capture_end(self)
+
+        @functools.wraps(CUDAGraph.replay)
+        def patched_replay(self):  # pyrefly: ignore
+            mode._orig_replay(self)
+            mode._on_graph_replay(self)
+
+        @functools.wraps(CUDAGraph.reset)
+        def patched_reset(self):  # pyrefly: ignore
+            mode._graph_profiles.pop(id(self), None)
+            return mode._orig_reset(self)
+
+        CUDAGraph.capture_begin = patched_capture_begin
+        CUDAGraph.capture_end = patched_capture_end
+        CUDAGraph.replay = patched_replay
+        CUDAGraph.reset = patched_reset
+        self._graph_hooks_installed = True
+
+    def _remove_graph_hooks(self) -> None:
+        if not self._graph_hooks_installed:
+            return
+        from torch.cuda.graphs import CUDAGraph
+
+        CUDAGraph.capture_begin = self._orig_capture_begin
+        CUDAGraph.capture_end = self._orig_capture_end
+        CUDAGraph.replay = self._orig_replay
+        CUDAGraph.reset = self._orig_reset
+        self._graph_hooks_installed = False
+
+    def _on_capture_begin(self, graph) -> None:
+        self._graph_profiles.pop(id(graph), None)
+        self._capturing_graph = graph
+        self._capture_reads = set()
+        self._capture_writes = set()
+
+    def _on_capture_end(self, graph) -> None:
+        if self._capturing_graph is not graph:
+            return
+        self._graph_profiles[id(graph)] = _GraphProfile(
+            reads=self._capture_reads,
+            writes=self._capture_writes,
+        )
+        self._capturing_graph = None
+
+    def _on_graph_replay(self, graph) -> None:
+        profile = self._graph_profiles.get(id(graph))
+        if profile is None:
+            return
+        errors = self.event_handler._handle_kernel_launch(
+            torch.cuda.current_stream().cuda_stream,
+            profile.reads - profile.writes,
+            profile.writes,
+            set(),
+            "CUDAGraph.replay()",
+            defaultdict(list),
+        )
+        if errors:
+            if self.accumulate:
+                self.accumulated_errors.extend(errors)
+            else:
+                for error in errors:
+                    print(error, file=sys.stderr)
+                raise CUDASanitizerErrors(errors)
+
 
 class CUDASanitizer:
     """Manages the lifetime of a CUDASanitizer dispatch mode object.
@@ -713,10 +813,12 @@ class CUDASanitizer:
         self.enabled = False
 
     def enable(self):
+        self.dispatch._install_graph_hooks()
         self.dispatch.__enter__()
         self.enabled = True
 
     def disable(self):
+        self.dispatch._remove_graph_hooks()
         self.dispatch.__exit__(None, None, None)
         self.enabled = False
 

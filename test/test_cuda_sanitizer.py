@@ -627,5 +627,128 @@ class TestCUDASanitizerEndToEnd(TestCase):
         self.assertGreaterEqual(len(san.errors), 3)
 
 
+class TestCUDAGraphStreamSafety(TestCase):
+    """Tests that the sanitizer detects cross-stream races involving CUDA graph replay.
+
+    CUDA graph replay executes as a single cudaGraphLaunch call invisible to
+    __torch_dispatch__. The sanitizer hooks CUDAGraph.replay() to emit synthetic
+    read/write events from the capture-time tensor profile, enabling vector-clock
+    race detection between graph replays and surrounding ops.
+    """
+
+    def test_graph_replay_cross_stream_race(self):
+        g = torch.cuda.CUDAGraph()
+        s1 = torch.cuda.Stream()
+        static_input = torch.zeros(1024, device="cuda")
+        static_output = torch.zeros(1024, device="cuda")
+
+        with csan.cuda_sanitizer as san:
+            with torch.cuda.stream(s1):
+                with torch.cuda.graph(g, stream=s1):
+                    static_output.copy_(static_input + 1)
+
+            # Replay on s1
+            with torch.cuda.stream(s1):
+                g.replay()
+
+            # Read static_output on default stream without sync -- race!
+            _ = static_output.sum()
+
+        self.assertGreater(len(san.errors), 0)
+
+    def test_graph_replay_no_false_positive_with_sync(self):
+        g = torch.cuda.CUDAGraph()
+        s1 = torch.cuda.Stream()
+        static_input = torch.zeros(1024, device="cuda")
+        static_output = torch.zeros(1024, device="cuda")
+
+        with csan.cuda_sanitizer as san:
+            with torch.cuda.stream(s1):
+                with torch.cuda.graph(g, stream=s1):
+                    static_output.copy_(static_input + 1)
+
+            with torch.cuda.stream(s1):
+                g.replay()
+
+            # Sync before reading on default stream
+            torch.cuda.current_stream().wait_stream(s1)
+            _ = static_output.sum()
+
+        self.assertEqual(len(san.errors), 0)
+
+    def test_graph_input_modification_race(self):
+        g = torch.cuda.CUDAGraph()
+        s1 = torch.cuda.Stream()
+        static_input = torch.zeros(1024, device="cuda")
+        static_output = torch.zeros(1024, device="cuda")
+
+        with csan.cuda_sanitizer as san:
+            with torch.cuda.stream(s1):
+                with torch.cuda.graph(g, stream=s1):
+                    static_output.copy_(static_input + 1)
+
+            # Modify static_input on default stream
+            static_input.fill_(42.0)
+
+            # Replay on s1 reads static_input -- race with the fill_ above!
+            with torch.cuda.stream(s1):
+                g.replay()
+
+            torch.cuda.synchronize()
+
+        self.assertGreater(len(san.errors), 0)
+
+    def test_graph_replay_same_stream_safe(self):
+        g = torch.cuda.CUDAGraph()
+        s1 = torch.cuda.Stream()
+        static_input = torch.zeros(1024, device="cuda")
+        static_output = torch.zeros(1024, device="cuda")
+
+        with csan.cuda_sanitizer as san:
+            with torch.cuda.stream(s1):
+                with torch.cuda.graph(g, stream=s1):
+                    static_output.copy_(static_input + 1)
+
+            # Replay and consume on the same stream -- no race
+            with torch.cuda.stream(s1):
+                g.replay()
+                _ = static_output.sum()
+
+            torch.cuda.synchronize()
+
+        self.assertEqual(len(san.errors), 0)
+
+    def test_graph_recapture_updates_profile(self):
+        g = torch.cuda.CUDAGraph()
+        s1 = torch.cuda.Stream()
+        t1 = torch.zeros(512, device="cuda")
+        t2 = torch.zeros(512, device="cuda")
+
+        with csan.cuda_sanitizer as san:
+            # First capture: touches t1
+            with torch.cuda.stream(s1):
+                with torch.cuda.graph(g, stream=s1):
+                    t1.fill_(1.0)
+
+            profile1 = san.dispatch._graph_profiles.get(id(g))
+            self.assertIsNotNone(profile1)
+            self.assertIn(t1.data_ptr(), profile1.writes)
+
+            # Reset and re-capture: now touches t2 instead
+            g.reset()
+            self.assertNotIn(id(g), san.dispatch._graph_profiles)
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(s1):
+                with torch.cuda.graph(g, stream=s1):
+                    t2.fill_(2.0)
+
+            profile2 = san.dispatch._graph_profiles.get(id(g))
+            self.assertIsNotNone(profile2)
+            self.assertIn(t2.data_ptr(), profile2.writes)
+
+        self.assertEqual(len(san.errors), 0)
+
+
 if __name__ == "__main__":
     run_tests()
