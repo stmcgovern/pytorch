@@ -4502,7 +4502,7 @@ static void* uncached_allocate(size_t size) {
   const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
   if (C10_UNLIKELY(interp)) {
     (*interp)->trace_gpu_memory_allocation(
-        c10::kCUDA, reinterpret_cast<uintptr_t>(devPtr));
+        c10::kCUDA, reinterpret_cast<uintptr_t>(devPtr), size);
   }
   return devPtr;
 }
@@ -4515,7 +4515,7 @@ static void uncached_delete(void* ptr) {
   const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
   if (C10_UNLIKELY(interp)) {
     (*interp)->trace_gpu_memory_deallocation(
-        c10::kCUDA, reinterpret_cast<uintptr_t>(ptr));
+        c10::kCUDA, reinterpret_cast<uintptr_t>(ptr), 0);
   }
   C10_CUDA_CHECK(cudaFree(ptr));
 }
@@ -4619,7 +4619,7 @@ class NativeCachingAllocator : public CUDAAllocator {
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
     if (C10_UNLIKELY(interp)) {
       (*interp)->trace_gpu_memory_allocation(
-          c10::kCUDA, reinterpret_cast<uintptr_t>(*devPtr));
+          c10::kCUDA, reinterpret_cast<uintptr_t>(*devPtr), block->size);
     }
   }
 
@@ -4645,7 +4645,7 @@ class NativeCachingAllocator : public CUDAAllocator {
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
     if (C10_UNLIKELY(interp)) {
       (*interp)->trace_gpu_memory_allocation(
-          c10::kCUDA, reinterpret_cast<uintptr_t>(*devPtr));
+          c10::kCUDA, reinterpret_cast<uintptr_t>(*devPtr), block->size);
     }
   }
 
@@ -4660,7 +4660,9 @@ class NativeCachingAllocator : public CUDAAllocator {
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
     if (C10_UNLIKELY(interp)) {
       (*interp)->trace_gpu_memory_deallocation(
-          c10::kCUDA, reinterpret_cast<uintptr_t>(block->ptr));
+          c10::kCUDA,
+          reinterpret_cast<uintptr_t>(block->ptr),
+          block->size);
     }
     device_allocator[block->device]->free(block);
   }

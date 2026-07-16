@@ -1,7 +1,6 @@
 # Owner(s): ["module: cuda"]
 
 import sys
-import textwrap
 import traceback
 
 import torch
@@ -138,6 +137,9 @@ def stream_id(i: int) -> StreamId:
 
 def event_id(i: int) -> EventId:
     return 2000 + i
+
+
+BLOCK_SIZE = 1024
 
 
 class TestEventHandler(TestCase):
@@ -394,6 +396,145 @@ class TestEventHandler(TestCase):
         self.assert_good_kernel_launch(stream_id(2), read_write=[tensor_id(1)])
         self.assert_bad_kernel_launch(1, stream_id(2), read_write=[tensor_id(2)])
 
+    def test_allocator_reuse_race(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        errors = self.kernel_launch(stream_id(2), read_write=[tensor_id(1)])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], csan.AllocatorReuseRaceError)
+
+    def test_allocator_reuse_same_stream_safe(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+
+    def test_allocator_reuse_with_record_stream(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_record_stream(tensor_id(1), stream_id(1))
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(2), read_write=[tensor_id(1)])
+
+    def test_allocator_reuse_partial_record_stream(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.assert_good_kernel_launch(stream_id(1), read_only=[tensor_id(1)])
+        self.handler._handle_event_record(event_id(0), stream_id(1))
+        self.handler._handle_event_wait(event_id(0), stream_id(2))
+        self.assert_good_kernel_launch(stream_id(2), read_only=[tensor_id(1)])
+        self.handler._handle_record_stream(tensor_id(1), stream_id(1))
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        errors = self.kernel_launch(stream_id(3), read_write=[tensor_id(1)])
+        reuse_errors = [
+            e for e in errors if isinstance(e, csan.AllocatorReuseRaceError)
+        ]
+        self.assertEqual(len(reuse_errors), 1)
+
+    def test_allocator_reuse_with_explicit_sync(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_event_record(event_id(0), stream_id(1))
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_event_wait(event_id(0), stream_id(2))
+        self.assert_good_kernel_launch(stream_id(2), read_write=[tensor_id(1)])
+
+    def test_allocator_reuse_cleanup_on_device_sync(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_device_synchronization()
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(2), read_write=[tensor_id(1)])
+
+    def test_allocator_reuse_prior_reads_checked_by_write(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.assert_good_kernel_launch(stream_id(1), read_only=[tensor_id(1)])
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        errors = self.kernel_launch(stream_id(2), read_write=[tensor_id(1)])
+        reuse_errors = [
+            e for e in errors if isinstance(e, csan.AllocatorReuseRaceError)
+        ]
+        self.assertEqual(len(reuse_errors), 2)
+
+    def test_record_stream_tracking(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_record_stream(tensor_id(1), stream_id(1))
+        self.handler._handle_record_stream(tensor_id(1), stream_id(2))
+        self.assertEqual(
+            self.handler.pledged_streams[tensor_id(1)],
+            {stream_id(1), stream_id(2)},
+        )
+
+    def test_allocator_reuse_write_clears_prior(self):
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        self.assert_good_kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_memory_deallocation(tensor_id(1), BLOCK_SIZE)
+        self.handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        errors = self.kernel_launch(stream_id(2), read_write=[tensor_id(1)])
+        self.assertEqual(len(errors), 1)
+        self.handler._handle_event_record(event_id(0), stream_id(2))
+        self.handler._handle_event_wait(event_id(0), stream_id(3))
+        errors = self.kernel_launch(stream_id(3), read_write=[tensor_id(1)])
+        reuse_errors = [
+            e for e in errors if isinstance(e, csan.AllocatorReuseRaceError)
+        ]
+        self.assertEqual(len(reuse_errors), 0)
+
+    def test_allocator_reuse_split_block(self):
+        base = tensor_id(1)
+        self.handler._handle_memory_allocation(base, BLOCK_SIZE)
+        self.handler._handle_stream_creation(stream_id(1))
+        self.handler._handle_stream_creation(stream_id(2))
+        self.assert_good_kernel_launch(stream_id(1), read_write=[base])
+        self.handler._handle_memory_deallocation(base, BLOCK_SIZE)
+        split_ptr = base + BLOCK_SIZE // 2
+        self.handler._handle_memory_allocation(split_ptr, BLOCK_SIZE // 2)
+        errors = self.kernel_launch(stream_id(2), read_write=[split_ptr])
+        reuse_errors = [
+            e for e in errors if isinstance(e, csan.AllocatorReuseRaceError)
+        ]
+        self.assertEqual(len(reuse_errors), 1)
+
+    def test_allocator_reuse_coalesce_blocks(self):
+        base = tensor_id(1)
+        upper = base + BLOCK_SIZE
+        self.handler._handle_memory_allocation(base, BLOCK_SIZE)
+        self.handler._handle_memory_allocation(upper, BLOCK_SIZE)
+        self.handler._handle_stream_creation(stream_id(1))
+        self.handler._handle_stream_creation(stream_id(2))
+        self.handler._handle_stream_creation(stream_id(3))
+        self.assert_good_kernel_launch(stream_id(1), read_write=[base])
+        self.assert_good_kernel_launch(stream_id(2), read_write=[upper])
+        self.handler._handle_memory_deallocation(base, BLOCK_SIZE)
+        self.handler._handle_memory_deallocation(upper, BLOCK_SIZE)
+        self.handler._handle_memory_allocation(base, BLOCK_SIZE * 2)
+        errors = self.kernel_launch(stream_id(3), read_write=[base])
+        reuse_errors = [
+            e for e in errors if isinstance(e, csan.AllocatorReuseRaceError)
+        ]
+        self.assertGreaterEqual(len(reuse_errors), 1)
+
+    def test_allocator_reuse_no_overlap(self):
+        base = tensor_id(1)
+        far = base + BLOCK_SIZE * 2
+        self.handler._handle_memory_allocation(base, BLOCK_SIZE)
+        self.handler._handle_stream_creation(stream_id(1))
+        self.handler._handle_stream_creation(stream_id(2))
+        self.assert_good_kernel_launch(stream_id(1), read_write=[base])
+        self.handler._handle_memory_deallocation(base, BLOCK_SIZE)
+        self.handler._handle_memory_allocation(far, BLOCK_SIZE)
+        errors = self.kernel_launch(stream_id(2), read_write=[far])
+        self.assertEqual(len(errors), 0)
+
 
 class TestMessages(TestCase):
     def setUp(self):
@@ -402,24 +543,16 @@ class TestMessages(TestCase):
 
     def test_ensure_exists(self):
         ARG = 0
-        for func, out in [
-            (
-                self.handler._handle_event_deletion,
-                f"Found Event with id: {ARG}, but no matching event "
-                "creation in the trace. Backfilling the trace now. "
-                "Perhaps the sanitizer was enabled after some torch operations?",
-            ),
-            (
-                self.handler._handle_memory_deallocation,
-                f"Found tensor with pointer: {ARG}, but no matching tensor "
-                "allocation in the trace. Backfilling the trace now. "
-                "Perhaps the sanitizer was enabled after some torch operations?",
-            ),
-        ]:
-            with self.subTest(func=func, out=out):
-                with self.assertLogs() as captured:
-                    func(ARG)
-                self.assertEqual(captured.records[0].getMessage(), out)
+        with self.subTest(func=self.handler._handle_event_deletion):
+            with self.assertLogs() as captured:
+                self.handler._handle_event_deletion(ARG)
+            self.assertIn("Found Event with id: 0", captured.records[0].getMessage())
+        with self.subTest(func=self.handler._handle_memory_deallocation):
+            with self.assertLogs() as captured:
+                self.handler._handle_memory_deallocation(ARG, BLOCK_SIZE)
+            self.assertIn(
+                "Found tensor with pointer: 0", captured.records[0].getMessage()
+            )
 
     def test_ensure_does_not_exist(self):
         ARG = 0
@@ -476,32 +609,105 @@ class TestMessages(TestCase):
             current_access=current_access,
             previous_access=previous_access,
         )
-        self.assertEqual(
-            str(error),
-            textwrap.dedent(
-                """\
-                ============================
-                CSAN detected a possible data race on tensor with data pointer 1
-                Access by stream 1001 during kernel:
-                schema
-                writing to argument(s) b, and to the output
-                With stack trace:
-                  File "file", line 0, in name
-                    trace a
+        error_str = str(error)
+        self.assertIn("CSAN detected a possible data race", error_str)
+        self.assertIn("data pointer 1", error_str)
+        self.assertIn("stream 1001", error_str)
+        self.assertIn("stream 1000", error_str)
+        self.assertIn("trace a", error_str)
+        self.assertIn("trace b", error_str)
+        self.assertIn("alloc", error_str)
+        self.assertIn("have never synchronized", error_str)
+        self.assertIn("wait_stream", error_str)
 
-                Previous access by stream 1000 during kernel:
-                schema
-                reading from argument(s) a
-                With stack trace:
-                  File "file", line 0, in name
-                    trace b
-
-                Tensor was allocated with stack trace:
-                  File "file", line 0, in name
-                    alloc
-                """
-            ),
+    def test_error_shows_sync_frontier(self):
+        current_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=10,
+            stream=stream_id(1),
+            operator="op",
+            aliases=[],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list([("f", 0, "n", "")]),
         )
+        previous_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=5,
+            stream=stream_id(0),
+            operator="op",
+            aliases=[],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list([("f", 0, "n", "")]),
+        )
+        error = csan.UnsynchronizedAccessError(
+            tensor_id(1),
+            None,
+            current_access,
+            previous_access,
+            known_seq=3,
+        )
+        error_str = str(error)
+        self.assertIn("up to seq 3", error_str)
+        self.assertIn("seq 5", error_str)
+        self.assertNotIn("never synchronized", error_str)
+
+    def test_error_never_synced(self):
+        current_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=10,
+            stream=stream_id(1),
+            operator="op",
+            aliases=[],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list([("f", 0, "n", "")]),
+        )
+        previous_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=5,
+            stream=stream_id(0),
+            operator="op",
+            aliases=[],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list([("f", 0, "n", "")]),
+        )
+        error = csan.UnsynchronizedAccessError(
+            tensor_id(1),
+            None,
+            current_access,
+            previous_access,
+            known_seq=-1,
+        )
+        self.assertIn("have never synchronized", str(error))
+
+    def test_allocator_reuse_error_message(self):
+        current_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=10,
+            stream=stream_id(1),
+            operator="op",
+            aliases=[],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list([("f", 0, "n", "")]),
+        )
+        previous_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=5,
+            stream=stream_id(0),
+            operator="op",
+            aliases=[],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list([("f", 0, "n", "")]),
+        )
+        error = csan.AllocatorReuseRaceError(
+            tensor_id(1),
+            None,
+            current_access,
+            previous_access,
+            None,
+        )
+        error_str = str(error)
+        self.assertIn("allocator memory reuse", error_str)
+        self.assertIn("record_stream", error_str)
 
     def test_subclass(self):
         class MyT(torch.Tensor):
@@ -518,6 +724,76 @@ class TestMessages(TestCase):
             MyT(torch.rand(2))
         finally:
             csan.cuda_sanitizer.disable()
+
+
+class TestDeduplication(TestCase):
+    """Tests for race signature deduplication (S2 iteration periodicity)."""
+
+    def setUp(self):
+        super().setUp()
+        self.handler = csan.EventHandler()
+
+    def kernel_launch(
+        self,
+        stream: StreamId,
+        read_only: list[DataPtr] | None = None,
+        read_write: list[DataPtr] | None = None,
+        operator: str = "",
+    ) -> list[csan.SynchronizationError]:
+        if read_only is None:
+            read_only = []
+        if read_write is None:
+            read_write = []
+        return self.handler._handle_kernel_launch(
+            stream,
+            read_only,
+            read_write,
+            {},
+            operator,
+            {k: [""] for k in read_only + read_write},
+        )
+
+    def test_race_dedup_same_signature(self):
+        mode = csan.CUDASanitizerDispatchMode()
+        mode.accumulate = True
+        mode.event_handler = self.handler
+        for _ in range(5):
+            self.kernel_launch(stream_id(1), read_write=[tensor_id(1)], operator="op_a")
+            errors = self.kernel_launch(
+                stream_id(2), read_write=[tensor_id(1)], operator="op_b"
+            )
+            mode._report_errors(errors)
+            self.handler._handle_device_synchronization()
+        self.assertEqual(len(mode.accumulated_errors), 1)
+        sig = mode.accumulated_errors[0].race_signature
+        self.assertEqual(mode._seen_race_sigs[sig], 5)
+
+    def test_race_dedup_different_signatures(self):
+        mode = csan.CUDASanitizerDispatchMode()
+        mode.accumulate = True
+        mode.event_handler = self.handler
+        self.kernel_launch(stream_id(1), read_write=[tensor_id(1)], operator="op_a")
+        errors1 = self.kernel_launch(
+            stream_id(2), read_write=[tensor_id(1)], operator="op_b"
+        )
+        mode._report_errors(errors1)
+        self.handler._handle_device_synchronization()
+        self.kernel_launch(stream_id(1), read_write=[tensor_id(2)], operator="op_c")
+        errors2 = self.kernel_launch(
+            stream_id(3), read_write=[tensor_id(2)], operator="op_d"
+        )
+        mode._report_errors(errors2)
+        self.assertEqual(len(mode.accumulated_errors), 2)
+
+    def test_known_seq_in_errors(self):
+        self.kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_event_record(event_id(0), stream_id(1))
+        self.kernel_launch(stream_id(1), read_write=[tensor_id(1)])
+        self.handler._handle_event_wait(event_id(0), stream_id(2))
+        errors = self.kernel_launch(stream_id(2), read_write=[tensor_id(1)])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], csan.UnsynchronizedAccessError)
+        self.assertGreater(errors[0].known_seq, -1)
 
 
 class TestNCCLStreamResolution(TestCase):
@@ -625,6 +901,271 @@ class TestCUDASanitizerEndToEnd(TestCase):
                 _ = t.sum()
                 torch.cuda.synchronize()
         self.assertGreaterEqual(len(san.errors), 3)
+
+    def test_catches_overlapping_view_race(self):
+        with csan.cuda_sanitizer as san:
+            s1 = torch.cuda.Stream()
+            t = torch.zeros(100, device="cuda")
+            a = t[:60]
+            b = t[40:]
+            s1.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s1):
+                a.fill_(1.0)
+            # b overlaps a, read on default stream without sync -- race
+            _ = b.sum()
+        overlap_errors = [
+            e for e in san.errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertGreater(len(overlap_errors), 0)
+
+    def test_no_false_positive_non_overlapping_views(self):
+        with csan.cuda_sanitizer as san:
+            s1 = torch.cuda.Stream()
+            t = torch.zeros(100, device="cuda")
+            a = t[:40]
+            b = t[60:]
+            s1.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s1):
+                a.fill_(1.0)
+            torch.cuda.current_stream().wait_stream(s1)
+            _ = b.sum()
+        overlap_errors = [
+            e for e in san.errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 0)
+
+
+class TestByteRangeComputation(TestCase):
+    def test_contiguous_1d(self):
+        t = torch.randn(10, device="cuda")
+        start, end = csan._tensor_byte_range(t)
+        self.assertEqual(start, t.data_ptr())
+        self.assertEqual(end, t.data_ptr() + 10 * t.element_size())
+
+    def test_contiguous_2d(self):
+        t = torch.randn(3, 4, device="cuda")
+        start, end = csan._tensor_byte_range(t)
+        self.assertEqual(start, t.data_ptr())
+        self.assertEqual(end, t.data_ptr() + 12 * t.element_size())
+
+    def test_slice_view(self):
+        t = torch.randn(10, device="cuda")
+        v = t[2:8]
+        start, end = csan._tensor_byte_range(v)
+        self.assertEqual(start, v.data_ptr())
+        self.assertEqual(end, v.data_ptr() + 6 * v.element_size())
+
+    def test_transpose_view(self):
+        t = torch.randn(3, 4, device="cuda")
+        v = t.t()
+        start, end = csan._tensor_byte_range(v)
+        self.assertEqual(start, t.data_ptr())
+        self.assertEqual(end, t.data_ptr() + 12 * t.element_size())
+
+    def test_zero_stride(self):
+        t = torch.randn(1, 10, device="cuda")
+        v = t.expand(5, 10)
+        start, end = csan._tensor_byte_range(v)
+        self.assertEqual(start, t.data_ptr())
+        self.assertEqual(end, t.data_ptr() + 10 * t.element_size())
+
+    def test_scalar(self):
+        t = torch.tensor(1.0, device="cuda")
+        start, end = csan._tensor_byte_range(t)
+        self.assertEqual(start, t.data_ptr())
+        self.assertEqual(end, t.data_ptr() + t.element_size())
+
+    def test_empty(self):
+        t = torch.empty(0, device="cuda")
+        start, end = csan._tensor_byte_range(t)
+        self.assertEqual(start, end)
+
+
+class TestViewOverlapDetection(TestCase):
+    """Tests for view-overlap race detection in EventHandler."""
+
+    def setUp(self):
+        super().setUp()
+        self.handler = csan.EventHandler()
+
+    def kernel_launch_with_ranges(
+        self,
+        stream: StreamId,
+        read_only: list[DataPtr] | None = None,
+        read_write: list[DataPtr] | None = None,
+        byte_ranges: dict[DataPtr, tuple[int, int]] | None = None,
+    ) -> list[csan.SynchronizationError]:
+        if read_only is None:
+            read_only = []
+        if read_write is None:
+            read_write = []
+        return self.handler._handle_kernel_launch(
+            stream,
+            read_only,
+            read_write,
+            {},
+            "",
+            {k: [""] for k in read_only + read_write},
+            byte_ranges=byte_ranges,
+        )
+
+    def test_overlapping_write_read_race(self):
+        errors = self.kernel_launch_with_ranges(
+            stream_id(1),
+            read_write=[tensor_id(1)],
+            byte_ranges={tensor_id(1): (100, 200)},
+        )
+        self.assertEqual(errors, [])
+        errors = self.kernel_launch_with_ranges(
+            stream_id(2),
+            read_only=[tensor_id(2)],
+            byte_ranges={tensor_id(2): (150, 250)},
+        )
+        overlap_errors = [
+            e for e in errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 1)
+
+    def test_overlapping_write_write_race(self):
+        self.kernel_launch_with_ranges(
+            stream_id(1),
+            read_write=[tensor_id(1)],
+            byte_ranges={tensor_id(1): (100, 200)},
+        )
+        errors = self.kernel_launch_with_ranges(
+            stream_id(2),
+            read_write=[tensor_id(2)],
+            byte_ranges={tensor_id(2): (150, 250)},
+        )
+        overlap_errors = [
+            e for e in errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 1)
+
+    def test_overlapping_read_read_safe(self):
+        self.kernel_launch_with_ranges(
+            stream_id(1),
+            read_only=[tensor_id(1)],
+            byte_ranges={tensor_id(1): (100, 200)},
+        )
+        errors = self.kernel_launch_with_ranges(
+            stream_id(2),
+            read_only=[tensor_id(2)],
+            byte_ranges={tensor_id(2): (150, 250)},
+        )
+        overlap_errors = [
+            e for e in errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 0)
+
+    def test_overlapping_with_sync(self):
+        self.kernel_launch_with_ranges(
+            stream_id(1),
+            read_write=[tensor_id(1)],
+            byte_ranges={tensor_id(1): (100, 200)},
+        )
+        self.handler._handle_event_record(event_id(0), stream_id(1))
+        self.handler._handle_event_wait(event_id(0), stream_id(2))
+        errors = self.kernel_launch_with_ranges(
+            stream_id(2),
+            read_write=[tensor_id(2)],
+            byte_ranges={tensor_id(2): (150, 250)},
+        )
+        overlap_errors = [
+            e for e in errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 0)
+
+    def test_non_overlapping_adjacent(self):
+        self.kernel_launch_with_ranges(
+            stream_id(1),
+            read_write=[tensor_id(1)],
+            byte_ranges={tensor_id(1): (100, 200)},
+        )
+        errors = self.kernel_launch_with_ranges(
+            stream_id(2),
+            read_write=[tensor_id(2)],
+            byte_ranges={tensor_id(2): (200, 300)},
+        )
+        overlap_errors = [
+            e for e in errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 0)
+
+    def test_no_byte_ranges_fallback(self):
+        self.kernel_launch_with_ranges(
+            stream_id(1),
+            read_write=[tensor_id(1)],
+        )
+        errors = self.kernel_launch_with_ranges(
+            stream_id(2),
+            read_write=[tensor_id(2)],
+        )
+        overlap_errors = [
+            e for e in errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 0)
+
+    def test_empty_range_no_overlap(self):
+        self.kernel_launch_with_ranges(
+            stream_id(1),
+            read_write=[tensor_id(1)],
+            byte_ranges={tensor_id(1): (100, 100)},
+        )
+        errors = self.kernel_launch_with_ranges(
+            stream_id(2),
+            read_write=[tensor_id(2)],
+            byte_ranges={tensor_id(2): (100, 200)},
+        )
+        overlap_errors = [
+            e for e in errors if isinstance(e, csan.OverlappingViewAccessError)
+        ]
+        self.assertEqual(len(overlap_errors), 0)
+
+
+class TestOverlappingViewMessage(TestCase):
+    def test_overlap_error_message(self):
+        current_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=2,
+            stream=stream_id(1),
+            operator="aten.fill_",
+            aliases=["self"],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list(
+                [("file.py", 10, "fn", "fill_(1.0)")]
+            ),
+            byte_range=(160, 400),
+        )
+        previous_access = csan.Access(
+            type=csan.AccessType.WRITE,
+            seq_num=1,
+            stream=stream_id(0),
+            operator="aten.mul_",
+            aliases=["self"],
+            is_output=False,
+            stack_trace=traceback.StackSummary.from_list(
+                [("file.py", 5, "fn", "mul_(2.0)")]
+            ),
+            byte_range=(0, 240),
+        )
+        error = csan.OverlappingViewAccessError(
+            current_data_ptr=tensor_id(2),
+            current_byte_range=(160, 400),
+            previous_data_ptr=tensor_id(1),
+            previous_byte_range=(0, 240),
+            current_access=current_access,
+            previous_access=previous_access,
+        )
+        error_str = str(error)
+        self.assertIn("overlapping views", error_str)
+        self.assertIn(str(tensor_id(1)), error_str)
+        self.assertIn(str(tensor_id(2)), error_str)
+        self.assertIn("[160, 240)", error_str)
+        self.assertIn("stream 1001", error_str)
+        self.assertIn("stream 1000", error_str)
+        self.assertIn("wait_stream", error_str)
+        self.assertIn("have never synchronized", error_str)
 
 
 class TestCUDAGraphStreamSafety(TestCase):

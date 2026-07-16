@@ -63,7 +63,10 @@ class TestCudaTrace(TestCase):
         gpu_trace.register_callback_for_memory_allocation(self.mock)
 
         tensor = torch.empty(10, 4, device="cuda")
-        self.mock.assert_called_once_with(tensor.data_ptr())
+        self.mock.assert_called_once()
+        args = self.mock.call_args[0]
+        self.assertEqual(args[0], tensor.data_ptr())
+        self.assertGreater(args[1], 0)
 
     def test_memory_deallocation_callback(self):
         gpu_trace.register_callback_for_memory_deallocation(self.mock)
@@ -71,7 +74,10 @@ class TestCudaTrace(TestCase):
         tensor = torch.empty(3, 8, device="cuda")
         data_ptr = tensor.data_ptr()
         del tensor
-        self.mock.assert_called_once_with(data_ptr)
+        self.mock.assert_called_once()
+        args = self.mock.call_args[0]
+        self.assertEqual(args[0], data_ptr)
+        self.assertGreaterEqual(args[1], 0)
 
     def test_stream_creation_callback(self):
         gpu_trace.register_callback_for_stream_creation(self.mock)
@@ -120,8 +126,10 @@ class TestCudaTrace(TestCase):
         gpu_trace.register_callback_for_memory_allocation(other)
 
         tensor = torch.empty(10, 4, device="cuda")
-        self.mock.assert_called_once_with(tensor.data_ptr())
-        other.assert_called_once_with(tensor.data_ptr())
+        self.mock.assert_called_once()
+        other.assert_called_once()
+        self.assertEqual(self.mock.call_args[0][0], tensor.data_ptr())
+        self.assertEqual(other.call_args[0][0], tensor.data_ptr())
 
 
 if __name__ == "__main__":

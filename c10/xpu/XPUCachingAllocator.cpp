@@ -1853,7 +1853,7 @@ class NativeCachingAllocator : public XPUAllocator {
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
     if (C10_UNLIKELY(interp)) {
       (*interp)->trace_gpu_memory_allocation(
-          c10::kXPU, reinterpret_cast<uintptr_t>(*devPtr));
+          c10::kXPU, reinterpret_cast<uintptr_t>(*devPtr), block->size);
     }
   }
 
@@ -1863,11 +1863,13 @@ class NativeCachingAllocator : public XPUAllocator {
     }
     Block* block = get_allocated_block(ptr, /* remove */ true);
     TORCH_CHECK(block, "invalid device pointer: ", ptr);
+    const auto block_ptr = reinterpret_cast<uintptr_t>(block->ptr);
+    const auto block_size = block->size;
     device_allocators[block->device]->free(block);
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
     if (C10_UNLIKELY(interp)) {
       (*interp)->trace_gpu_memory_deallocation(
-          c10::kXPU, reinterpret_cast<uintptr_t>(block->ptr));
+          c10::kXPU, block_ptr, block_size);
     }
   }
 

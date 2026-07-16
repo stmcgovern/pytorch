@@ -51,6 +51,24 @@ logger = logging.getLogger(__name__)
 FACTORY_FUNCTION_REGEX = re.compile("(new_.*|.*_like)")
 
 
+def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    """Bounding-box byte range of a tensor's accessible memory."""
+    ptr = tensor.data_ptr()
+    if ptr == 0 or tensor.numel() == 0:
+        return (ptr, ptr)
+    min_offset = 0
+    max_offset = 0
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        if size > 1:
+            step = (size - 1) * stride
+            if step > 0:
+                max_offset += step
+            else:
+                min_offset += step
+    elem_size = tensor.element_size()
+    return (ptr + min_offset * elem_size, ptr + max_offset * elem_size + elem_size)
+
+
 class AccessType(enum.Enum):
     READ = enum.auto()
     WRITE = enum.auto()
@@ -81,6 +99,7 @@ class Access:
     aliases: list[str]
     is_output: bool
     stack_trace: traceback.StackSummary
+    byte_range: tuple[int, int] | None = None
 
 
 class SynchronizationError(Exception):
@@ -96,11 +115,24 @@ class UnsynchronizedAccessError(SynchronizationError):
         allocation_stack_trace: traceback.StackSummary | None,
         current_access: Access,
         previous_access: Access,
+        known_seq: SeqNum = -1,
     ):
         self.data_ptr = data_ptr
         self.allocation_stack_trace = allocation_stack_trace
         self.current_access = current_access
         self.previous_access = previous_access
+        self.known_seq = known_seq
+
+    @property
+    def race_signature(self) -> tuple:
+        return (
+            self.current_access.stream,
+            str(self.current_access.operator),
+            self.current_access.type,
+            self.previous_access.stream,
+            str(self.previous_access.operator),
+            self.previous_access.type,
+        )
 
     def __str__(self):
         def format_access(access: Access):
@@ -135,10 +167,197 @@ class UnsynchronizedAccessError(SynchronizationError):
             if self.allocation_stack_trace:
                 message.write(
                     "Tensor was allocated with stack trace:\n"
-                    f"{''.join(self.allocation_stack_trace.format())}"
+                    f"{''.join(self.allocation_stack_trace.format())}\n"
                 )
             else:
-                message.write("Trace for tensor allocation not found.")
+                message.write("Trace for tensor allocation not found.\n")
+
+            if self.known_seq == -1:
+                message.write(
+                    f"\nStreams {self.current_access.stream} and "
+                    f"{self.previous_access.stream} have never synchronized.\n"
+                )
+            else:
+                message.write(
+                    f"\nLast sync: stream {self.current_access.stream} synced with "
+                    f"stream {self.previous_access.stream} up to seq {self.known_seq}, "
+                    f"but the conflicting access was at seq "
+                    f"{self.previous_access.seq_num}.\n"
+                )
+
+            message.write(
+                "\nTo fix: synchronize the streams before the second access:\n"
+                "  torch.cuda.current_stream().wait_stream(other_stream)\n"
+            )
+            return message.getvalue()
+
+
+class AllocatorReuseRaceError(SynchronizationError):
+    """Race between a freed tensor's in-flight ops and a new allocation at the same address."""
+
+    def __init__(
+        self,
+        data_ptr: DataPtr,
+        allocation_stack_trace: traceback.StackSummary | None,
+        current_access: Access,
+        previous_access: Access,
+        previous_alloc_stack_trace: traceback.StackSummary | None,
+        known_seq: SeqNum = -1,
+    ):
+        self.data_ptr = data_ptr
+        self.allocation_stack_trace = allocation_stack_trace
+        self.current_access = current_access
+        self.previous_access = previous_access
+        self.previous_alloc_stack_trace = previous_alloc_stack_trace
+        self.known_seq = known_seq
+
+    @property
+    def race_signature(self) -> tuple:
+        return (
+            self.current_access.stream,
+            str(self.current_access.operator),
+            self.current_access.type,
+            self.previous_access.stream,
+            str(self.previous_access.operator),
+            self.previous_access.type,
+        )
+
+    def __str__(self):
+        def format_access(access: Access):
+            message.write(f"{access.operator}\n{access.type}")
+            if access.aliases:
+                message.write(" argument(s) " + ", ".join(access.aliases))
+                if access.is_output:
+                    message.write(", and to")
+            if access.is_output:
+                message.write(" the output")
+            message.write(
+                f"\nWith stack trace:\n{''.join(access.stack_trace.format())}\n"
+            )
+
+        with io.StringIO() as message:
+            message.write(
+                textwrap.dedent(
+                    f"""\
+                    ============================
+                    CSAN detected a possible data race from allocator memory reuse
+                    on tensor with data pointer {self.data_ptr}
+                    New access by stream {self.current_access.stream} during kernel:
+                    """
+                )
+            )
+            format_access(self.current_access)
+
+            message.write(
+                f"Previous-lifetime access by stream {self.previous_access.stream} during kernel:\n"
+            )
+            format_access(self.previous_access)
+
+            if self.previous_alloc_stack_trace:
+                message.write(
+                    "Previous tensor was allocated with stack trace:\n"
+                    f"{''.join(self.previous_alloc_stack_trace.format())}\n"
+                )
+
+            if self.allocation_stack_trace:
+                message.write(
+                    "New tensor was allocated with stack trace:\n"
+                    f"{''.join(self.allocation_stack_trace.format())}"
+                )
+
+            message.write(
+                "\nTo fix: call tensor.record_stream(stream) before freeing "
+                "the tensor,\nor synchronize the streams before the new allocation:\n"
+                "  torch.cuda.current_stream().wait_stream(other_stream)\n"
+            )
+            return message.getvalue()
+
+
+class OverlappingViewAccessError(SynchronizationError):
+    """Race between overlapping views of the same storage on different streams."""
+
+    def __init__(
+        self,
+        current_data_ptr: DataPtr,
+        current_byte_range: tuple[int, int],
+        previous_data_ptr: DataPtr,
+        previous_byte_range: tuple[int, int],
+        current_access: Access,
+        previous_access: Access,
+        known_seq: SeqNum = -1,
+    ):
+        self.current_data_ptr = current_data_ptr
+        self.current_byte_range = current_byte_range
+        self.previous_data_ptr = previous_data_ptr
+        self.previous_byte_range = previous_byte_range
+        self.current_access = current_access
+        self.previous_access = previous_access
+        self.known_seq = known_seq
+
+    @property
+    def race_signature(self) -> tuple:
+        return (
+            self.current_access.stream,
+            str(self.current_access.operator),
+            self.current_access.type,
+            self.previous_access.stream,
+            str(self.previous_access.operator),
+            self.previous_access.type,
+        )
+
+    def __str__(self):
+        def format_access(access: Access):
+            message.write(f"{access.operator}\n{access.type}")
+            if access.aliases:
+                message.write(" argument(s) " + ", ".join(access.aliases))
+                if access.is_output:
+                    message.write(", and to")
+            if access.is_output:
+                message.write(" the output")
+            message.write(
+                f"\nWith stack trace:\n{''.join(access.stack_trace.format())}\n"
+            )
+
+        overlap_start = max(self.current_byte_range[0], self.previous_byte_range[0])
+        overlap_end = min(self.current_byte_range[1], self.previous_byte_range[1])
+
+        with io.StringIO() as message:
+            message.write(
+                textwrap.dedent(
+                    f"""\
+                    ============================
+                    CSAN detected a possible data race between overlapping views
+                    Current tensor at {self.current_data_ptr} (bytes [{self.current_byte_range[0]}, {self.current_byte_range[1]}))
+                    Previous tensor at {self.previous_data_ptr} (bytes [{self.previous_byte_range[0]}, {self.previous_byte_range[1]}))
+                    Overlapping region: bytes [{overlap_start}, {overlap_end})
+                    Access by stream {self.current_access.stream} during kernel:
+                    """
+                )
+            )
+            format_access(self.current_access)
+
+            message.write(
+                f"Previous access by stream {self.previous_access.stream} during kernel:\n"
+            )
+            format_access(self.previous_access)
+
+            if self.known_seq == -1:
+                message.write(
+                    f"\nStreams {self.current_access.stream} and "
+                    f"{self.previous_access.stream} have never synchronized.\n"
+                )
+            else:
+                message.write(
+                    f"\nLast sync: stream {self.current_access.stream} synced with "
+                    f"stream {self.previous_access.stream} up to seq {self.known_seq}, "
+                    f"but the conflicting access was at seq "
+                    f"{self.previous_access.seq_num}.\n"
+                )
+
+            message.write(
+                "\nTo fix: synchronize the streams before the second access:\n"
+                "  torch.cuda.current_stream().wait_stream(other_stream)\n"
+            )
             return message.getvalue()
 
 
@@ -153,6 +372,25 @@ class CUDASanitizerErrors(Exception):
 
 
 @dataclass
+class _PendingFree:
+    """Access history stashed when a tensor is freed, pending allocator reuse."""
+
+    write: Access | None
+    reads: list[Access]
+    allocation_stack_trace: traceback.StackSummary | None
+    pledged_streams: set[StreamId]
+
+
+@dataclass
+class _PriorLifecycleAccesses:
+    """Uncovered accesses from a previous allocation at the same data_ptr."""
+
+    write: Access | None
+    reads: list[Access]
+    allocation_stack_trace: traceback.StackSummary | None
+
+
+@dataclass
 class TensorInfo:
     r"""Stores information about a single tensor and recent accesses to it.
 
@@ -162,11 +400,14 @@ class TensorInfo:
         reads: list of read accesses to the tensor that were performed since
             the last write.
         write: the last write access to the tensor.
+        prior_lifecycle: uncovered accesses from a previous allocation at this
+            data_ptr, checked against new accesses to detect allocator reuse races.
     """
 
     allocation_stack_trace: traceback.StackSummary | None
     reads: list[Access] = field(default_factory=list)
     write: Access | None = None
+    prior_lifecycle: _PriorLifecycleAccesses | None = None
 
 
 class _TensorsAccessed:
@@ -349,6 +590,8 @@ class EventHandler:
         self.tensors_accessed = _TensorsAccessed()
         self.syncs = StreamSynchronizations()
         self.seq_num: SeqNum = 0
+        self.pledged_streams: dict[DataPtr, set[StreamId]] = {}
+        self.pending_frees: list[tuple[int, int, _PendingFree]] = []
 
     def reset(self) -> None:
         self.__init__()
@@ -361,7 +604,13 @@ class EventHandler:
         outputs: set[DataPtr],
         operator: str,
         tensor_aliases: dict[int, list[str]],
+        byte_ranges: dict[DataPtr, tuple[int, int]] | None = None,
     ) -> list[SynchronizationError]:
+        def _get_known_seq(current: Access, previous: Access) -> SeqNum:
+            return self.syncs.current_sync_states.get(current.stream, {}).get(
+                previous.stream, -1
+            )
+
         def check_conflict(
             data_ptr: DataPtr, current_access: Access, previous_access: Access | None
         ) -> None:
@@ -376,8 +625,59 @@ class EventHandler:
                         self.tensors_accessed.get_allocation_stack_trace(data_ptr),
                         current_access,
                         previous_access,
+                        _get_known_seq(current_access, previous_access),
                     )
                 )
+
+        def check_prior_lifecycle(data_ptr: DataPtr, current_access: Access) -> None:
+            prior = self.tensors_accessed.accesses[data_ptr].prior_lifecycle
+            if prior is None:
+                return
+            if current_access.type is AccessType.WRITE:
+                if prior.write is not None and not self.syncs.is_ordered_after(
+                    current_access.stream, prior.write.seq_num, prior.write.stream
+                ):
+                    error_list.append(
+                        AllocatorReuseRaceError(
+                            data_ptr,
+                            self.tensors_accessed.get_allocation_stack_trace(data_ptr),
+                            current_access,
+                            prior.write,
+                            prior.allocation_stack_trace,
+                            _get_known_seq(current_access, prior.write),
+                        )
+                    )
+                for prev_read in prior.reads:
+                    if not self.syncs.is_ordered_after(
+                        current_access.stream, prev_read.seq_num, prev_read.stream
+                    ):
+                        error_list.append(
+                            AllocatorReuseRaceError(
+                                data_ptr,
+                                self.tensors_accessed.get_allocation_stack_trace(
+                                    data_ptr
+                                ),
+                                current_access,
+                                prev_read,
+                                prior.allocation_stack_trace,
+                                _get_known_seq(current_access, prev_read),
+                            )
+                        )
+                self.tensors_accessed.accesses[data_ptr].prior_lifecycle = None
+            else:
+                if prior.write is not None and not self.syncs.is_ordered_after(
+                    current_access.stream, prior.write.seq_num, prior.write.stream
+                ):
+                    error_list.append(
+                        AllocatorReuseRaceError(
+                            data_ptr,
+                            self.tensors_accessed.get_allocation_stack_trace(data_ptr),
+                            current_access,
+                            prior.write,
+                            prior.allocation_stack_trace,
+                            _get_known_seq(current_access, prior.write),
+                        )
+                    )
 
         error_list: list[SynchronizationError] = []
         self.seq_num += 1
@@ -399,10 +699,12 @@ class EventHandler:
                 tensor_aliases[data_ptr],
                 data_ptr in outputs,
                 stack_trace,
+                byte_range=byte_ranges.get(data_ptr) if byte_ranges else None,
             )
             check_conflict(
                 data_ptr, current_access, self.tensors_accessed.get_write(data_ptr)
             )
+            check_prior_lifecycle(data_ptr, current_access)
             self.tensors_accessed.add_read(data_ptr, current_access)
 
         for data_ptr in read_write:
@@ -415,6 +717,7 @@ class EventHandler:
                 tensor_aliases[data_ptr],
                 data_ptr in outputs,
                 stack_trace,
+                byte_range=byte_ranges.get(data_ptr) if byte_ranges else None,
             )
             if self.tensors_accessed.were_there_reads_since_last_write(data_ptr):
                 for previous_access in self.tensors_accessed.get_reads(data_ptr):
@@ -423,9 +726,88 @@ class EventHandler:
                 check_conflict(
                     data_ptr, current_access, self.tensors_accessed.get_write(data_ptr)
                 )
+            check_prior_lifecycle(data_ptr, current_access)
             self.tensors_accessed.set_write(data_ptr, current_access)
 
+        if byte_ranges:
+            self._check_view_overlaps(
+                stream, read_only, read_write, byte_ranges, error_list, _get_known_seq
+            )
+
         return error_list
+
+    def _check_view_overlaps(
+        self,
+        stream: StreamId,
+        read_only: set[DataPtr],
+        read_write: set[DataPtr],
+        byte_ranges: dict[DataPtr, tuple[int, int]],
+        error_list: list[SynchronizationError],
+        _get_known_seq,
+    ) -> None:
+        current_accesses: list[tuple[DataPtr, tuple[int, int], Access]] = []
+        for data_ptr in read_only:
+            br = byte_ranges.get(data_ptr)
+            if br and br[0] < br[1]:
+                reads = self.tensors_accessed.get_reads(data_ptr)
+                if reads:
+                    current_accesses.append((data_ptr, br, reads[-1]))
+        for data_ptr in read_write:
+            br = byte_ranges.get(data_ptr)
+            if br and br[0] < br[1]:
+                write = self.tensors_accessed.get_write(data_ptr)
+                if write:
+                    current_accesses.append((data_ptr, br, write))
+
+        for cur_ptr, cur_range, cur_access in current_accesses:
+            for other_ptr, other_info in self.tensors_accessed.accesses.items():
+                if other_ptr == cur_ptr:
+                    continue
+                if other_info.write is not None:
+                    prev_br = other_info.write.byte_range
+                    if (
+                        prev_br
+                        and prev_br[0] < cur_range[1]
+                        and cur_range[0] < prev_br[1]
+                    ):
+                        if not self.syncs.is_ordered_after(
+                            cur_access.stream,
+                            other_info.write.seq_num,
+                            other_info.write.stream,
+                        ):
+                            error_list.append(
+                                OverlappingViewAccessError(
+                                    cur_ptr,
+                                    cur_range,
+                                    other_ptr,
+                                    prev_br,
+                                    cur_access,
+                                    other_info.write,
+                                    _get_known_seq(cur_access, other_info.write),
+                                )
+                            )
+                if cur_access.type is AccessType.WRITE:
+                    for prev_read in other_info.reads:
+                        prev_br = prev_read.byte_range
+                        if (
+                            prev_br
+                            and prev_br[0] < cur_range[1]
+                            and cur_range[0] < prev_br[1]
+                        ):
+                            if not self.syncs.is_ordered_after(
+                                cur_access.stream, prev_read.seq_num, prev_read.stream
+                            ):
+                                error_list.append(
+                                    OverlappingViewAccessError(
+                                        cur_ptr,
+                                        cur_range,
+                                        other_ptr,
+                                        prev_br,
+                                        cur_access,
+                                        prev_read,
+                                        _get_known_seq(cur_access, prev_read),
+                                    )
+                                )
 
     def _handle_event_creation(self, event: EventId) -> None:
         self.syncs.create_event(event)
@@ -439,7 +821,7 @@ class EventHandler:
     def _handle_event_wait(self, event: EventId, stream: StreamId) -> None:
         self.syncs.stream_wait_for_event(stream, event)
 
-    def _handle_memory_allocation(self, data_ptr: DataPtr) -> None:
+    def _handle_memory_allocation(self, data_ptr: DataPtr, size: int) -> None:
         self.tensors_accessed.ensure_tensor_does_not_exist(data_ptr)
         stack_trace = traceback.StackSummary.extract(
             traceback.walk_stack(inspect.currentframe()), lookup_lines=False
@@ -451,16 +833,64 @@ class EventHandler:
             data_ptr,
             stack_trace,
         )
+        alloc_end = data_ptr + max(size, 1)
+        overlapping = []
+        remaining = []
+        for start, end, pf in self.pending_frees:
+            if start < alloc_end and end > data_ptr:
+                overlapping.append(pf)
+            else:
+                remaining.append((start, end, pf))
+        self.pending_frees = remaining
+        if overlapping:
+            prior_write = None
+            prior_reads: list[Access] = []
+            alloc_stack = None
+            for pf in overlapping:
+                if pf.write and pf.write.stream not in pf.pledged_streams:
+                    prior_write = pf.write
+                prior_reads.extend(
+                    r for r in pf.reads if r.stream not in pf.pledged_streams
+                )
+                if pf.allocation_stack_trace:
+                    alloc_stack = pf.allocation_stack_trace
+            if prior_write is not None or prior_reads:
+                self.tensors_accessed.accesses[
+                    data_ptr
+                ].prior_lifecycle = _PriorLifecycleAccesses(
+                    prior_write, prior_reads, alloc_stack
+                )
 
-    def _handle_memory_deallocation(self, data_ptr: DataPtr) -> None:
+    def _handle_memory_deallocation(self, data_ptr: DataPtr, size: int) -> None:
         self.tensors_accessed.ensure_tensor_exists(data_ptr)
+        info = self.tensors_accessed.accesses[data_ptr]
+        pledged = self.pledged_streams.pop(data_ptr, set())
+        free_end = data_ptr + max(size, 1)
+        self.pending_frees.append(
+            (
+                data_ptr,
+                free_end,
+                _PendingFree(
+                    write=info.write,
+                    reads=list(info.reads),
+                    allocation_stack_trace=info.allocation_stack_trace,
+                    pledged_streams=pledged,
+                ),
+            )
+        )
         self.tensors_accessed.delete_tensor(data_ptr)
+
+    def _handle_record_stream(self, data_ptr: DataPtr, stream: StreamId) -> None:
+        self.pledged_streams.setdefault(data_ptr, set()).add(stream)
 
     def _handle_stream_creation(self, stream: StreamId) -> None:
         self.syncs.create_stream(stream)
 
     def _handle_device_synchronization(self) -> None:
         self.syncs.sync_all_streams()
+        self.pending_frees.clear()
+        for info in self.tensors_accessed.accesses.values():
+            info.prior_lifecycle = None
 
     def _handle_stream_synchronization(self, stream: StreamId) -> None:
         self.syncs.all_streams_wait_for_stream(stream)
@@ -493,6 +923,7 @@ class ArgumentHandler:
         self.dataptrs_written: set[DataPtr] = set()
         self.tensor_aliases: dict[DataPtr, list[str]] = {}
         self.outputs: set[DataPtr] = set()
+        self.byte_ranges: dict[DataPtr, tuple[int, int]] = {}
 
     def _handle_argument(
         self,
@@ -505,7 +936,8 @@ class ArgumentHandler:
         if isinstance(value, torch.Tensor) and value.is_cuda:
             # data_ptr() is preferred, but distinguish Tensors with null data_ptr()
             # otherwise two empty Tensors could incorrectly match as a conflict
-            data_ptr = value.data_ptr() if value.data_ptr() else id(value)
+            raw_ptr = value.data_ptr()
+            data_ptr = raw_ptr if raw_ptr else id(value)
             if is_write:
                 self.dataptrs_written.add(data_ptr)
             elif not metadata_only:
@@ -516,6 +948,18 @@ class ArgumentHandler:
                 self.tensor_aliases[data_ptr].append(name)
             if is_output:
                 self.outputs.add(data_ptr)
+
+            if raw_ptr:
+                br = _tensor_byte_range(value)
+                if br[0] < br[1]:
+                    existing = self.byte_ranges.get(data_ptr)
+                    if existing is not None:
+                        self.byte_ranges[data_ptr] = (
+                            min(existing[0], br[0]),
+                            max(existing[1], br[1]),
+                        )
+                    else:
+                        self.byte_ranges[data_ptr] = br
 
     def parse_inputs(
         self,
@@ -571,6 +1015,7 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
         self.event_handler = EventHandler()
         self.accumulated_errors: list[SynchronizationError] = []
         self.accumulate: bool = False
+        self._seen_race_sigs: dict[tuple, int] = {}
         self._graph_profiles: dict[int, _GraphProfile] = {}
         self._capturing_graph: Any = None
         self._capture_reads: set[int] = set()
@@ -613,7 +1058,19 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
             kwargs = {}
 
         if func is aten.record_stream.default:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            tensor = args[0]  # pyrefly: ignore
+            if tensor.is_cuda and tensor.data_ptr():
+                stream_arg = args[1]  # pyrefly: ignore
+                cuda_stream = torch.cuda.Stream(
+                    stream_id=stream_arg.stream_id,
+                    device_index=stream_arg.device_index,
+                    device_type=stream_arg.device_type,
+                )
+                self.event_handler._handle_record_stream(
+                    tensor.data_ptr(), cuda_stream.cuda_stream
+                )
+            return result
 
         is_factory = bool(FACTORY_FUNCTION_REGEX.match(func._schema.name))
 
@@ -634,14 +1091,9 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
             argument_handler.outputs,
             func._schema,
             argument_handler.tensor_aliases,
+            byte_ranges=argument_handler.byte_ranges,
         )
-        if errors:
-            if self.accumulate:
-                self.accumulated_errors.extend(errors)
-            else:
-                for error in errors:
-                    print(error, file=sys.stderr)
-                raise CUDASanitizerErrors(errors)
+        self._report_errors(errors)
 
         if self._capturing_graph is not None:
             self._capture_reads |= argument_handler.dataptrs_read
@@ -673,16 +1125,28 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
             set(),
             func._schema,
             argument_handler.tensor_aliases,
+            byte_ranges=argument_handler.byte_ranges,
         )
-        if errors:
-            if self.accumulate:
-                self.accumulated_errors.extend(errors)
-            else:
-                for error in errors:
-                    print(error, file=sys.stderr)
-                raise CUDASanitizerErrors(errors)
+        self._report_errors(errors)
 
         return func(*args, **kwargs)
+
+    def _report_errors(self, errors: list[SynchronizationError]) -> None:
+        if not errors:
+            return
+        if self.accumulate:
+            for error in errors:
+                sig = getattr(error, "race_signature", None)
+                if sig is not None and sig in self._seen_race_sigs:
+                    self._seen_race_sigs[sig] += 1
+                else:
+                    if sig is not None:
+                        self._seen_race_sigs[sig] = 1
+                    self.accumulated_errors.append(error)
+        else:
+            for error in errors:
+                print(error, file=sys.stderr)
+            raise CUDASanitizerErrors(errors)
 
     def _is_async_nccl_collective(
         self, schema: torch.FunctionSchema, args: tuple, kwargs: dict
@@ -781,13 +1245,7 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
             "CUDAGraph.replay()",
             defaultdict(list),
         )
-        if errors:
-            if self.accumulate:
-                self.accumulated_errors.extend(errors)
-            else:
-                for error in errors:
-                    print(error, file=sys.stderr)
-                raise CUDASanitizerErrors(errors)
+        self._report_errors(errors)
 
 
 class CUDASanitizer:
@@ -830,6 +1288,7 @@ class CUDASanitizer:
     def __enter__(self):
         self.dispatch.event_handler.reset()
         self.dispatch.accumulated_errors.clear()
+        self.dispatch._seen_race_sigs.clear()
         self.dispatch.accumulate = True
         if not self.enabled:
             self.enable()
