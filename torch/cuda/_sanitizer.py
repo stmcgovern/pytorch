@@ -185,6 +185,19 @@ class UnsynchronizedAccessError(SynchronizationError):
                     f"{self.previous_access.seq_num}.\n"
                 )
 
+            cur_op = str(self.current_access.operator)
+            prev_op = str(self.previous_access.operator)
+            if cur_op.startswith("symm_mem::") and prev_op.startswith(
+                "symm_mem::"
+            ):
+                message.write(
+                    "\nNote: concurrent symm_mem collectives share a signal "
+                    "pad namespace (no channel isolation in "
+                    "sync_remote_blocks). Even on different tensors, the "
+                    "underlying CAS operations will interfere, causing "
+                    "wrong-pair consumption or SM-exhaustion deadlock.\n"
+                )
+
             message.write(
                 "\nTo fix: synchronize the streams before the second access:\n"
                 "  torch.cuda.current_stream().wait_stream(other_stream)\n"
