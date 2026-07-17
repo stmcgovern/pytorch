@@ -370,6 +370,294 @@ class TestFSDP2StreamSafety(FSDPTest):
             len(san.errors), 0, f"Sanitizer detected {len(san.errors)} stream race(s)"
         )
 
+    # ------------------------------------------------------------------
+    # Phase 4: Optimizer hook integration
+    #
+    # Validates that user collectives and in-place tensor modifications
+    # inside optimizer hooks (register_step_pre_hook / post_hook) are
+    # stream-safe on FSDP2 models.  The contract: after finalize_backward
+    # drains _last_post_reduce_events, the default stream is ordered past
+    # all gradient communication, so hooks running on the default stream
+    # can safely read .grad, launch collectives, and write back.
+    # ------------------------------------------------------------------
+
+    @skip_if_lt_x_gpu(2)
+    def test_stream_safety_optim_hook_pre_step_collectives(self):
+        """Test 11: User collectives + grad writeback in optimizer pre-hook.
+
+        Bridges exercised: all of Phase 1 (F1b/d, F2, G1, H1, P1/P2, R2)
+        plus the hook->FSDP2 contract: pre-hook reads .grad, runs
+        all_reduce and all_gather_into_tensor, writes .grad in-place.
+        Mimics OSFT's project_gradients pattern.
+        """
+        torch.manual_seed(42)
+        dim = 16
+        model = nn.Sequential(*[MLP(dim) for _ in range(3)])
+        for module in model:
+            fully_shard(module)
+        fully_shard(model)
+        model = model.cuda()
+
+        def pre_hook(opt, args, kwargs):
+            for group in opt.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    local_grad = (
+                        grad._local_tensor
+                        if hasattr(grad, "_local_tensor")
+                        else grad.detach()
+                    )
+                    coeff = torch.zeros(4, device=local_grad.device)
+                    coeff.add_(local_grad.flatten()[:4])
+                    dist.all_reduce(coeff)
+                    ws = dist.get_world_size()
+                    gathered = torch.empty(4 * ws, device=coeff.device)
+                    dist.all_gather_into_tensor(gathered, coeff)
+                    scale = gathered.sum() / gathered.numel()
+                    projected = local_grad * (scale / (scale + 1e-6))
+                    if hasattr(grad, "_local_tensor"):
+                        grad._local_tensor.copy_(projected)
+                    else:
+                        p.grad.data.copy_(projected)
+
+        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+        optim.register_step_pre_hook(pre_hook)
+
+        with csan.cuda_sanitizer as san:
+            for _ in range(4):
+                optim.zero_grad()
+                loss = model(torch.randn(4, dim, device="cuda")).sum()
+                loss.backward()
+                optim.step()
+                torch.cuda.synchronize()
+        self.assertEqual(
+            len(san.errors), 0, f"Sanitizer detected {len(san.errors)} stream race(s)"
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_stream_safety_optim_hook_post_step_collectives(self):
+        """Test 12: User collectives + param writeback in optimizer post-hook.
+
+        Bridges exercised: all of Phase 1 plus the hook->FSDP2 contract:
+        post-hook reads .data, runs all_reduce, writes back via
+        _local_tensor.copy_() for DTensor params.  Mimics OSFT's
+        project_parameters pattern.
+        """
+        torch.manual_seed(42)
+        dim = 16
+        model = nn.Sequential(*[MLP(dim) for _ in range(3)])
+        for module in model:
+            fully_shard(module)
+        fully_shard(model)
+        model = model.cuda()
+
+        def post_hook(opt, args, kwargs):
+            with torch.no_grad():
+                for group in opt.param_groups:
+                    for p in group["params"]:
+                        local = (
+                            p.data._local_tensor
+                            if hasattr(p.data, "_local_tensor")
+                            else p.data
+                        )
+                        coeff = torch.zeros(4, device=local.device)
+                        coeff.add_(local.flatten()[:4])
+                        dist.all_reduce(coeff)
+                        ws = dist.get_world_size()
+                        gathered = torch.empty(4 * ws, device=coeff.device)
+                        dist.all_gather_into_tensor(gathered, coeff)
+                        scale = gathered.sum() / gathered.numel()
+                        projected = local * (scale / (scale + 1e-6))
+                        if hasattr(p.data, "_local_tensor"):
+                            p.data._local_tensor.copy_(projected)
+                        else:
+                            p.data.copy_(projected)
+
+        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+        optim.register_step_post_hook(post_hook)
+
+        with csan.cuda_sanitizer as san:
+            for _ in range(4):
+                optim.zero_grad()
+                loss = model(torch.randn(4, dim, device="cuda")).sum()
+                loss.backward()
+                optim.step()
+                torch.cuda.synchronize()
+        self.assertEqual(
+            len(san.errors), 0, f"Sanitizer detected {len(san.errors)} stream race(s)"
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_stream_safety_optim_hook_with_post_optim_event(self):
+        """Test 13: Post-hook collectives + set_post_optim_event.
+
+        Bridges exercised: F1a/c (post_optim_event variant) plus Phase 1.
+        Critical ordering: event is recorded AFTER post-hook writeback, so
+        the next forward's all-gather reads written-back parameters.
+        """
+        torch.manual_seed(42)
+        dim = 16
+        model = nn.Sequential(*[MLP(dim) for _ in range(3)])
+        for module in model:
+            fully_shard(module)
+        fully_shard(model)
+        model = model.cuda()
+
+        def post_hook(fsdp_model, opt, args, kwargs):
+            with torch.no_grad():
+                for group in opt.param_groups:
+                    for p in group["params"]:
+                        local = (
+                            p.data._local_tensor
+                            if hasattr(p.data, "_local_tensor")
+                            else p.data
+                        )
+                        coeff = torch.zeros(4, device=local.device)
+                        coeff.add_(local.flatten()[:4])
+                        dist.all_reduce(coeff)
+                        projected = local * 0.999
+                        if hasattr(p.data, "_local_tensor"):
+                            p.data._local_tensor.copy_(projected)
+                        else:
+                            p.data.copy_(projected)
+            event = torch.cuda.current_stream().record_event()
+            fsdp_model.set_post_optim_event(event)
+
+        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+        optim.register_step_post_hook(functools.partial(post_hook, model))
+
+        with csan.cuda_sanitizer as san:
+            for _ in range(4):
+                optim.zero_grad()
+                loss = model(torch.randn(4, dim, device="cuda")).sum()
+                loss.backward()
+                optim.step()
+                torch.cuda.synchronize()
+        self.assertEqual(
+            len(san.errors), 0, f"Sanitizer detected {len(san.errors)} stream race(s)"
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_stream_safety_optim_hook_grad_accumulation(self):
+        """Test 14: Full OSFT hook pattern with gradient accumulation.
+
+        Bridges exercised: A1 (cross-micro-batch), plus Phase 1 and F1a/c.
+        With 2 micro-batches, finalize_backward runs only on the last one.
+        Pre-hook fires once per optim.step(), after all micro-batches.
+        Post-hook exercises collectives + _local_tensor writeback +
+        set_post_optim_event -- the complete OSFT pattern under grad accum.
+        """
+        torch.manual_seed(42)
+        dim = 16
+        n_microbatches = 2
+        model = nn.Sequential(*[MLP(dim) for _ in range(3)])
+        for module in model:
+            fully_shard(module)
+        fully_shard(model)
+        model = model.cuda()
+
+        def pre_hook(opt, args, kwargs):
+            for group in opt.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    local_grad = (
+                        grad._local_tensor
+                        if hasattr(grad, "_local_tensor")
+                        else grad.detach()
+                    )
+                    coeff = torch.zeros(4, device=local_grad.device)
+                    coeff.add_(local_grad.flatten()[:4])
+                    dist.all_reduce(coeff)
+                    scale = coeff.sum() / (coeff.sum() + 1e-6)
+                    projected = local_grad * scale
+                    if hasattr(grad, "_local_tensor"):
+                        grad._local_tensor.copy_(projected)
+                    else:
+                        p.grad.data.copy_(projected)
+
+        def post_hook(fsdp_model, opt, args, kwargs):
+            with torch.no_grad():
+                for group in opt.param_groups:
+                    for p in group["params"]:
+                        local = (
+                            p.data._local_tensor
+                            if hasattr(p.data, "_local_tensor")
+                            else p.data
+                        )
+                        coeff = torch.zeros(4, device=local.device)
+                        coeff.add_(local.flatten()[:4])
+                        dist.all_reduce(coeff)
+                        projected = local * 0.999
+                        if hasattr(p.data, "_local_tensor"):
+                            p.data._local_tensor.copy_(projected)
+                        else:
+                            p.data.copy_(projected)
+            event = torch.cuda.current_stream().record_event()
+            fsdp_model.set_post_optim_event(event)
+
+        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+        optim.register_step_pre_hook(pre_hook)
+        optim.register_step_post_hook(functools.partial(post_hook, model))
+
+        with csan.cuda_sanitizer as san:
+            for _ in range(4):
+                optim.zero_grad()
+                for micro in range(n_microbatches):
+                    is_last = micro == n_microbatches - 1
+                    model.set_requires_gradient_sync(is_last)
+                    model.set_is_last_backward(is_last)
+                    loss = model(torch.randn(4, dim, device="cuda")).sum()
+                    loss.backward()
+                optim.step()
+                torch.cuda.synchronize()
+        self.assertEqual(
+            len(san.errors), 0, f"Sanitizer detected {len(san.errors)} stream race(s)"
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_stream_safety_optim_hook_deliberate_race(self):
+        """Test 15: Negative test -- sanitizer catches unsynchronized access.
+
+        Validates that the test harness is sensitive: a pre-hook that reads
+        .grad on a new stream without synchronization should race with the
+        reduce-scatter stream's write to the grad buffer.
+        """
+        torch.manual_seed(42)
+        dim = 16
+        model = nn.Sequential(*[MLP(dim) for _ in range(3)])
+        for module in model:
+            fully_shard(module)
+        fully_shard(model)
+        model = model.cuda()
+
+        def pre_hook_with_race(opt, args, kwargs):
+            s = torch.cuda.Stream()
+            for group in opt.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        with torch.cuda.stream(s):
+                            _ = p.grad.sum()
+
+        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+        optim.register_step_pre_hook(pre_hook_with_race)
+
+        with csan.cuda_sanitizer as san:
+            for _ in range(4):
+                optim.zero_grad()
+                loss = model(torch.randn(4, dim, device="cuda")).sum()
+                loss.backward()
+                optim.step()
+                torch.cuda.synchronize()
+        self.assertGreater(
+            len(san.errors),
+            0,
+            "Sanitizer should detect races from unsynchronized stream access",
+        )
+
 
 class _ChunkedHeadModel(nn.Module):
     """Minimal model for chunked-loss (partial-group backward) testing."""

@@ -396,6 +396,11 @@ class FSDPState(_State):
 
     @_dynamo_disable
     def _root_post_backward_final_callback(self) -> None:
+        # NOTE: After this callback returns, the default (compute) stream is
+        # ordered past all FSDP2 gradient communication. Optimizer hooks
+        # (register_step_pre_hook / register_step_post_hook) run on the
+        # default stream, so they can safely read .grad, launch user
+        # collectives, and write back via _local_tensor.copy_().
         logger.debug("FSDP::root_post_backward")
         with torch.profiler.record_function("FSDP::root_post_backward_callback"):
             # Reset per-iteration state. With chunked loss, each standalone
