@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 # the ones we care about.
 FACTORY_FUNCTION_REGEX = re.compile("(new_.*|.*_like)")
 
+_SYMM_MEM_OP_PREFIX = "symm_mem::"
+
+_PENDING_FREES_GC_THRESHOLD = 256
+
 
 def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
     """Bounding-box byte range of a tensor's accessible memory."""
@@ -126,6 +130,7 @@ class UnsynchronizedAccessError(SynchronizationError):
     @property
     def race_signature(self) -> tuple:
         return (
+            self.data_ptr,
             self.current_access.stream,
             str(self.current_access.operator),
             self.current_access.type,
@@ -187,8 +192,8 @@ class UnsynchronizedAccessError(SynchronizationError):
 
             cur_op = str(self.current_access.operator)
             prev_op = str(self.previous_access.operator)
-            if cur_op.startswith("symm_mem::") and prev_op.startswith(
-                "symm_mem::"
+            if cur_op.startswith(_SYMM_MEM_OP_PREFIX) and prev_op.startswith(
+                _SYMM_MEM_OP_PREFIX
             ):
                 message.write(
                     "\nNote: concurrent symm_mem collectives share a signal "
@@ -227,6 +232,7 @@ class AllocatorReuseRaceError(SynchronizationError):
     @property
     def race_signature(self) -> tuple:
         return (
+            self.data_ptr,
             self.current_access.stream,
             str(self.current_access.operator),
             self.current_access.type,
@@ -309,7 +315,9 @@ class OverlappingViewAccessError(SynchronizationError):
 
     @property
     def race_signature(self) -> tuple:
+        ptrs = tuple(sorted((self.current_data_ptr, self.previous_data_ptr)))
         return (
+            ptrs,
             self.current_access.stream,
             str(self.current_access.operator),
             self.current_access.type,
@@ -599,7 +607,8 @@ class EventHandler:
     data race.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, check_view_overlaps: bool = False) -> None:
+        self._check_view_overlaps_enabled = check_view_overlaps
         self.tensors_accessed = _TensorsAccessed()
         self.syncs = StreamSynchronizations()
         self.seq_num: SeqNum = 0
@@ -607,7 +616,13 @@ class EventHandler:
         self.pending_frees: list[tuple[int, int, _PendingFree]] = []
 
     def reset(self) -> None:
-        self.__init__()
+        check_view = self._check_view_overlaps_enabled
+        self.tensors_accessed = _TensorsAccessed()
+        self.syncs = StreamSynchronizations()
+        self.seq_num = 0
+        self.pledged_streams.clear()
+        self.pending_frees.clear()
+        self._check_view_overlaps_enabled = check_view
 
     def _handle_kernel_launch(
         self,
@@ -742,7 +757,7 @@ class EventHandler:
             check_prior_lifecycle(data_ptr, current_access)
             self.tensors_accessed.set_write(data_ptr, current_access)
 
-        if byte_ranges:
+        if byte_ranges and self._check_view_overlaps_enabled:
             self._check_view_overlaps(
                 stream, read_only, read_write, byte_ranges, error_list, _get_known_seq
             )
@@ -892,6 +907,29 @@ class EventHandler:
             )
         )
         self.tensors_accessed.delete_tensor(data_ptr)
+        self._gc_pending_frees()
+
+    def _gc_pending_frees(self) -> None:
+        if len(self.pending_frees) <= _PENDING_FREES_GC_THRESHOLD:
+            return
+        remaining = []
+        for start, end, pf in self.pending_frees:
+            accesses: list[Access] = list(pf.reads)
+            if pf.write is not None:
+                accesses.append(pf.write)
+            dominated = True
+            for access in accesses:
+                if not dominated:
+                    break
+                for sid in self.syncs.current_sync_states:
+                    if not self.syncs.is_ordered_after(
+                        sid, access.seq_num, access.stream
+                    ):
+                        dominated = False
+                        break
+            if not dominated:
+                remaining.append((start, end, pf))
+        self.pending_frees = remaining
 
     def _handle_record_stream(self, data_ptr: DataPtr, stream: StreamId) -> None:
         self.pledged_streams.setdefault(data_ptr, set()).add(stream)
@@ -1024,8 +1062,8 @@ class _GraphProfile:
 
 
 class CUDASanitizerDispatchMode(TorchDispatchMode):
-    def __init__(self) -> None:
-        self.event_handler = EventHandler()
+    def __init__(self, *, check_view_overlaps: bool = False) -> None:
+        self.event_handler = EventHandler(check_view_overlaps=check_view_overlaps)
         self.accumulated_errors: list[SynchronizationError] = []
         self.accumulate: bool = False
         self._seen_race_sigs: dict[tuple, int] = {}
@@ -1129,6 +1167,10 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
            ArgumentHandler classifies tensor args as read-only.  Collectives
            modify tensors in-place, so all tensor ptrs are treated as
            read+write here.
+
+        MAINTENANCE: this path must stay in sync with the normal post-dispatch
+        path in __torch_dispatch__. If you add fields to ArgumentHandler or
+        change how _handle_kernel_launch is called, update both paths.
         """
         all_ptrs = argument_handler.dataptrs_read | argument_handler.dataptrs_written
         errors = self.event_handler._handle_kernel_launch(
@@ -1179,13 +1221,28 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
             if arg.name == "async_op":
                 if i < len(args):
                     return bool(args[i])
-                return bool(kwargs.get("async_op", True))
-        return True
+                if "async_op" in kwargs:
+                    return bool(kwargs["async_op"])
+                return bool(arg.default_value)
+        return False
 
     def _install_graph_hooks(self) -> None:
+        # CUDAGraph has no hook/callback API (C++ or Python), so we
+        # monkey-patch class methods. Limitations:
+        #   - Only one sanitizer instance can hook CUDAGraph at a time
+        #   - C++ cudaGraphLaunch calls bypass Python dispatch entirely
+        #   - Subclasses of CUDAGraph may not pick up the patches
+        # TODO: upstream CUDAGraph.register_replay_hook() to avoid this
         if self._graph_hooks_installed:
             return
         from torch.cuda.graphs import CUDAGraph
+
+        if hasattr(CUDAGraph.capture_begin, "_csan_patched"):
+            raise RuntimeError(
+                "CUDAGraph hooks are already installed by another "
+                "CUDASanitizerDispatchMode instance. Only one sanitizer "
+                "instance can hook CUDAGraph at a time."
+            )
 
         self._orig_capture_begin = CUDAGraph.capture_begin
         self._orig_capture_end = CUDAGraph.capture_end
@@ -1213,6 +1270,11 @@ class CUDASanitizerDispatchMode(TorchDispatchMode):
         def patched_reset(self):  # pyrefly: ignore
             mode._graph_profiles.pop(id(self), None)
             return mode._orig_reset(self)
+
+        patched_capture_begin._csan_patched = True
+        patched_capture_end._csan_patched = True
+        patched_replay._csan_patched = True
+        patched_reset._csan_patched = True
 
         CUDAGraph.capture_begin = patched_capture_begin
         CUDAGraph.capture_end = patched_capture_end
@@ -1279,8 +1341,10 @@ class CUDASanitizer:
     raising on the first one, and automatically disables on exit.
     """
 
-    def __init__(self) -> None:
-        self.dispatch = CUDASanitizerDispatchMode()
+    def __init__(self, *, check_view_overlaps: bool = False) -> None:
+        self.dispatch = CUDASanitizerDispatchMode(
+            check_view_overlaps=check_view_overlaps
+        )
         self.enabled = False
 
     def enable(self):
@@ -1325,14 +1389,22 @@ class CUDASanitizer:
             self.disable()
 
 
-def enable_cuda_sanitizer():
+def enable_cuda_sanitizer(*, check_view_overlaps: bool = False):
     """Enable CUDA Sanitizer.
 
     The sanitizer will begin to analyze low-level CUDA calls invoked by torch functions
     for synchronization errors. All data races found will be printed to the standard
     error output along with stack traces of suspected causes. For best results, the
     sanitizer should be enabled at the very beginning of the program.
+
+    Args:
+        check_view_overlaps: If True, enable O(n*T) view-overlap detection
+            that checks for races between overlapping views of the same
+            storage on different streams. Off by default for performance.
     """
+    cuda_sanitizer.dispatch.event_handler._check_view_overlaps_enabled = (
+        check_view_overlaps
+    )
     cuda_sanitizer.enable()
 
 

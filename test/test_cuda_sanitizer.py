@@ -536,6 +536,51 @@ class TestEventHandler(TestCase):
         self.assertEqual(len(errors), 0)
 
 
+class TestPendingFreesGC(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.handler = csan.EventHandler()
+
+    def _spaced_ptr(self, i: int) -> DataPtr:
+        return 0x100000 + i * BLOCK_SIZE * 2
+
+    def test_gc_via_sync_frontier(self):
+        self.handler._handle_stream_creation(stream_id(1))
+        count = csan._PENDING_FREES_GC_THRESHOLD + 50
+        for i in range(count):
+            ptr = self._spaced_ptr(i)
+            self.handler._handle_memory_allocation(ptr, BLOCK_SIZE)
+            self.handler._handle_kernel_launch(
+                stream_id(1), set(), {ptr}, set(), "", {ptr: [""]}
+            )
+            self.handler._handle_memory_deallocation(ptr, BLOCK_SIZE)
+        self.assertGreater(
+            len(self.handler.pending_frees), csan._PENDING_FREES_GC_THRESHOLD
+        )
+        self.handler._handle_stream_synchronization(stream_id(1))
+        # GC fires on deallocation, so alloc+use+dealloc a new tensor
+        ptr = self._spaced_ptr(count + 1)
+        self.handler._handle_memory_allocation(ptr, BLOCK_SIZE)
+        self.handler._handle_kernel_launch(
+            stream_id(1), set(), {ptr}, set(), "", {ptr: [""]}
+        )
+        self.handler._handle_memory_deallocation(ptr, BLOCK_SIZE)
+        self.assertLess(
+            len(self.handler.pending_frees), csan._PENDING_FREES_GC_THRESHOLD
+        )
+
+    def test_no_gc_below_threshold(self):
+        self.handler._handle_stream_creation(stream_id(1))
+        for i in range(10):
+            ptr = self._spaced_ptr(i)
+            self.handler._handle_memory_allocation(ptr, BLOCK_SIZE)
+            self.handler._handle_kernel_launch(
+                stream_id(1), set(), {ptr}, set(), "", {ptr: [""]}
+            )
+            self.handler._handle_memory_deallocation(ptr, BLOCK_SIZE)
+        self.assertEqual(len(self.handler.pending_frees), 10)
+
+
 class TestMessages(TestCase):
     def setUp(self):
         super().setUp()
@@ -785,6 +830,23 @@ class TestDeduplication(TestCase):
         mode._report_errors(errors2)
         self.assertEqual(len(mode.accumulated_errors), 2)
 
+    def test_race_dedup_different_tensors_same_operators(self):
+        mode = csan.CUDASanitizerDispatchMode()
+        mode.accumulate = True
+        mode.event_handler = self.handler
+        self.kernel_launch(stream_id(1), read_write=[tensor_id(1)], operator="op_a")
+        errors1 = self.kernel_launch(
+            stream_id(2), read_write=[tensor_id(1)], operator="op_b"
+        )
+        mode._report_errors(errors1)
+        self.handler._handle_device_synchronization()
+        self.kernel_launch(stream_id(1), read_write=[tensor_id(2)], operator="op_a")
+        errors2 = self.kernel_launch(
+            stream_id(2), read_write=[tensor_id(2)], operator="op_b"
+        )
+        mode._report_errors(errors2)
+        self.assertEqual(len(mode.accumulated_errors), 2)
+
     def test_known_seq_in_errors(self):
         self.kernel_launch(stream_id(1), read_write=[tensor_id(1)])
         self.handler._handle_event_record(event_id(0), stream_id(1))
@@ -821,9 +883,16 @@ class TestNCCLStreamResolution(TestCase):
         )
         self.assertFalse(result)
 
-    def test_extract_async_op_default_is_true(self):
+    def test_extract_async_op_uses_schema_default(self):
         schema = torch.ops.c10d.allreduce_.default._schema
         result = csan.CUDASanitizerDispatchMode._extract_async_op(schema, (), {})
+        self.assertTrue(result)
+
+    def test_extract_async_op_explicit_true(self):
+        schema = torch.ops.c10d.allreduce_.default._schema
+        result = csan.CUDASanitizerDispatchMode._extract_async_op(
+            schema, (), {"async_op": True}
+        )
         self.assertTrue(result)
 
     def test_non_c10d_op_is_not_async_collective(self):
@@ -848,10 +917,24 @@ class TestNCCLStreamResolution(TestCase):
         args[async_op_idx] = False
         self.assertFalse(mode._is_async_nccl_collective(schema, tuple(args), {}))
 
-    def test_c10d_async_op_is_async_collective(self):
+    def test_c10d_default_async_op_is_async_collective(self):
         mode = csan.CUDASanitizerDispatchMode()
         schema = torch.ops.c10d.allreduce_.default._schema
         self.assertTrue(mode._is_async_nccl_collective(schema, (), {}))
+
+    def test_async_path_records_write(self):
+        handler = csan.EventHandler()
+        handler._handle_stream_creation(stream_id(1))
+        handler._handle_memory_allocation(tensor_id(1), BLOCK_SIZE)
+        handler._handle_kernel_launch(
+            stream_id(1),
+            set(),
+            {tensor_id(1)},
+            set(),
+            "c10d::allreduce_",
+            {tensor_id(1): ["input"]},
+        )
+        self.assertIsNotNone(handler.tensors_accessed.get_write(tensor_id(1)))
 
 
 class TestCUDASanitizerEndToEnd(TestCase):
@@ -903,7 +986,8 @@ class TestCUDASanitizerEndToEnd(TestCase):
         self.assertGreaterEqual(len(san.errors), 3)
 
     def test_catches_overlapping_view_race(self):
-        with csan.cuda_sanitizer as san:
+        san = csan.CUDASanitizer(check_view_overlaps=True)
+        with san:
             s1 = torch.cuda.Stream()
             t = torch.zeros(100, device="cuda")
             a = t[:60]
@@ -919,7 +1003,8 @@ class TestCUDASanitizerEndToEnd(TestCase):
         self.assertGreater(len(overlap_errors), 0)
 
     def test_no_false_positive_non_overlapping_views(self):
-        with csan.cuda_sanitizer as san:
+        san = csan.CUDASanitizer(check_view_overlaps=True)
+        with san:
             s1 = torch.cuda.Stream()
             t = torch.zeros(100, device="cuda")
             a = t[:40]
@@ -986,7 +1071,7 @@ class TestViewOverlapDetection(TestCase):
 
     def setUp(self):
         super().setUp()
-        self.handler = csan.EventHandler()
+        self.handler = csan.EventHandler(check_view_overlaps=True)
 
     def kernel_launch_with_ranges(
         self,
@@ -1176,6 +1261,12 @@ class TestCUDAGraphStreamSafety(TestCase):
     read/write events from the capture-time tensor profile, enabling vector-clock
     race detection between graph replays and surrounding ops.
     """
+
+    def test_double_install_raises(self):
+        with csan.cuda_sanitizer:
+            mode2 = csan.CUDASanitizerDispatchMode()
+            with self.assertRaisesRegex(RuntimeError, "already installed"):
+                mode2._install_graph_hooks()
 
     def test_graph_replay_cross_stream_race(self):
         g = torch.cuda.CUDAGraph()
