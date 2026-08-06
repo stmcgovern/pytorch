@@ -27,7 +27,12 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.common_utils import run_tests, skipIfRocm
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    skipIfRocm,
+)
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     create_local_tensor_test_class,
     DTensorTestBase,
@@ -1710,62 +1715,99 @@ class DistMathOpsTest(DTensorTestBase):
         self.assertEqual(result.full_tensor(), expected)
         self.assertTrue(result.placements[0].is_shard(0))
 
+    _POOL_NAMES = [
+        "avg_pool2d",
+        "max_pool2d",
+        "adaptive_avg_pool2d",
+        "adaptive_max_pool2d",
+        "avg_pool3d",
+        "max_pool3d",
+        "adaptive_avg_pool3d",
+        "adaptive_max_pool3d",
+    ]
+
+    def _pool_backward_case(self, pool_name):
+        is_3d = "3d" in pool_name
+        shape = (8, 4, 8, 8, 8) if is_3d else (8, 4, 16, 16)
+        pool_fn = getattr(torch.nn.functional, pool_name)
+        arg = ((4, 4, 4) if is_3d else (4, 4)) if "adaptive" in pool_name else 2
+        if "max" in pool_name:
+            fn = lambda t: pool_fn(t, arg, return_indices=True)[0]  # noqa: E731
+        else:
+            fn = lambda t: pool_fn(t, arg)  # noqa: E731
+        return shape, fn
+
     @with_comms
-    def test_pooling_backward(self):
+    @parametrize("pool_name", _POOL_NAMES)
+    @parametrize("shard_dim", [0, 1])
+    def test_pooling_backward(self, pool_name, shard_dim):
+        device_mesh = self.build_device_mesh()
+        shape, fn = self._pool_backward_case(pool_name)
+
+        x = torch.randn(*shape, device=self.device_type, requires_grad=True)
+        dt_x = distribute_tensor(
+            x.detach().clone().requires_grad_(True),
+            device_mesh,
+            [Shard(shard_dim)],
+        )
+
+        out = fn(x)
+        out.sum().backward()
+
+        with CommDebugMode() as comm_mode:
+            dt_out = fn(dt_x)
+            dt_out.sum().backward()
+        self.assertEqual(comm_mode.get_total_counts(), 0)
+
+        self.assertEqual(dt_out.full_tensor(), out)
+        self.assertTrue(dt_out.placements[0].is_shard(shard_dim))
+        self.assertEqual(dt_x.grad.full_tensor(), x.grad)
+        self.assertTrue(dt_x.grad.placements[0].is_shard(shard_dim))
+
+    @with_comms
+    @parametrize("pool_name", _POOL_NAMES)
+    def test_pooling_backward_unbatched(self, pool_name):
+        """Unbatched: dim 0 = channel (zero comms), dim 1 = spatial (redistributes)."""
+        device_mesh = self.build_device_mesh()
+        batched_shape, fn = self._pool_backward_case(pool_name)
+        unbatched_shape = batched_shape[1:]
+
+        ref_x = torch.randn(
+            *unbatched_shape, device=self.device_type, requires_grad=True
+        )
+        ref_out = fn(ref_x)
+        ref_out.sum().backward()
+
+        for shard_dim in (0, 1):
+            dt_x = distribute_tensor(
+                ref_x.detach().clone().requires_grad_(True),
+                device_mesh,
+                [Shard(shard_dim)],
+            )
+            dt_out = fn(dt_x)
+            dt_out.sum().backward()
+            self.assertEqual(dt_out.full_tensor(), ref_out)
+            self.assertEqual(dt_x.grad.full_tensor(), ref_x.grad)
+
+    @with_comms
+    def test_max_unpool2d_partial_passthrough(self):
+        """max_unpool2d is linear in self, so Partial(sum) passes through."""
         device_mesh = self.build_device_mesh()
         F = torch.nn.functional
 
-        cases = [
-            ((8, 4, 16, 16), "avg_pool2d", lambda t: F.avg_pool2d(t, 2)),
-            ((8, 4, 16, 16), "max_pool2d", lambda t: F.max_pool2d(t, 2)),
-            (
-                (8, 4, 16, 16),
-                "adaptive_avg_pool2d",
-                lambda t: F.adaptive_avg_pool2d(t, (4, 4)),
-            ),
-            (
-                (8, 4, 16, 16),
-                "adaptive_max_pool2d",
-                lambda t: F.adaptive_max_pool2d(t, (4, 4)),
-            ),
-            ((8, 4, 8, 8, 8), "avg_pool3d", lambda t: F.avg_pool3d(t, 2)),
-            ((8, 4, 8, 8, 8), "max_pool3d", lambda t: F.max_pool3d(t, 2)),
-            (
-                (8, 4, 8, 8, 8),
-                "adaptive_avg_pool3d",
-                lambda t: F.adaptive_avg_pool3d(t, (4, 4, 4)),
-            ),
-            (
-                (8, 4, 8, 8, 8),
-                "adaptive_max_pool3d",
-                lambda t: F.adaptive_max_pool3d(t, (4, 4, 4)),
-            ),
-        ]
+        x = torch.randn(8, 4, 16, 16, device=self.device_type)
+        pooled, indices = F.max_pool2d(x, 2, return_indices=True)
 
-        for shard_dim in [0, 1]:
-            for shape, name, fn in cases:
-                with self.subTest(name=name, shard_dim=shard_dim):
-                    x = torch.randn(*shape, device=self.device_type, requires_grad=True)
-                    dt_x = distribute_tensor(
-                        x.detach().clone().requires_grad_(True),
-                        device_mesh,
-                        [Shard(shard_dim)],
-                    )
+        dt_pooled = DTensor.from_local(pooled, device_mesh, [Partial("sum")])
+        dt_indices = DTensor.from_local(indices, device_mesh, [Replicate()])
 
-                    out = fn(x)
-                    out_val = out[0] if isinstance(out, tuple) else out
-                    out_val.sum().backward()
+        with CommDebugMode() as comm_mode:
+            dt_out = F.max_unpool2d(dt_pooled, dt_indices, 2, output_size=x.shape[-2:])
+        self.assertEqual(comm_mode.get_total_counts(), 0)
+        self.assertTrue(dt_out.placements[0].is_partial())
 
-                    with CommDebugMode() as comm_mode:
-                        dt_out = fn(dt_x)
-                        dt_out_val = dt_out[0] if isinstance(dt_out, tuple) else dt_out
-                        dt_out_val.sum().backward()
-                    self.assertEqual(comm_mode.get_total_counts(), 0)
-
-                    self.assertEqual(dt_out_val.full_tensor(), out_val)
-                    self.assertTrue(dt_out_val.placements[0].is_shard(shard_dim))
-                    self.assertEqual(dt_x.grad.full_tensor(), x.grad)
-                    self.assertTrue(dt_x.grad.placements[0].is_shard(shard_dim))
+        expected = F.max_unpool2d(pooled, indices, 2, output_size=x.shape[-2:])
+        self.assertEqual(dt_out.to_local(), expected)
 
     @with_comms
     @skip_unless_torch_gpu
@@ -2088,6 +2130,7 @@ class DistMathOpsTest(DTensorTestBase):
         self.assertTrue(result_no_affine.placements[0].is_shard(0))
 
 
+instantiate_parametrized_tests(DistMathOpsTest)
 DistMathOpsTestWithLocalTensor = create_local_tensor_test_class(
     DistMathOpsTest,
 )

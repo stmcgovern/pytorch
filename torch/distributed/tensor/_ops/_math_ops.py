@@ -1816,18 +1816,12 @@ def interp_upsample_1out_1in_strategy(
     ]
 
 
-POOL_BACKWARD_SPATIAL_RANK: dict[torch._ops.OpOverload, int] = {
-    aten._adaptive_avg_pool2d_backward.default: 2,
-    aten._adaptive_avg_pool3d_backward.default: 3,
-    aten.avg_pool2d_backward.default: 2,
-    aten.avg_pool3d_backward.default: 3,
-    aten.max_pool2d_with_indices_backward.default: 2,
-    aten.max_pool3d_with_indices_backward.default: 3,
-    aten.adaptive_max_pool2d_backward.default: 2,
-    aten.adaptive_max_pool3d_backward.default: 3,
-    aten.max_unpool2d.default: 2,
-    aten.max_unpool3d.default: 3,
-}
+def _pool_spatial_rank(op: torch._ops.OpOverload) -> int:
+    name = op.name()
+    if "3d" in name:
+        return 3
+    assert "2d" in name, f"Cannot determine spatial rank for {name}"  # noqa: S101
+    return 2
 
 
 @register_single_dim_strategy(
@@ -1851,9 +1845,14 @@ def interp_pool_1out_2in_strategy(
     strategies: list[list[Placement | _ShardingPlaceholder]] = [
         [_ShardingPlaceholder(0)] * 3,
     ]
-    spatial_rank = POOL_BACKWARD_SPATIAL_RANK[op]
+    spatial_rank = _pool_spatial_rank(op)
     if len(input_meta.shape) >= spatial_rank + 2:
         strategies.append([_ShardingPlaceholder(1)] * 3)
+    # All ops here are linear in the first tensor arg (grad_output for
+    # avg/adaptive_avg backward, self for max_unpool), so Partial passes through.
+    r = Replicate()
+    for reduce_op in ("sum", "avg"):
+        strategies.append([Partial(reduce_op), Partial(reduce_op), r])
     return strategies
 
 
@@ -1877,7 +1876,7 @@ def pool_backward_strategy(
     strategies: list[list[Placement | _ShardingPlaceholder]] = [
         [_ShardingPlaceholder(0)] * 4,
     ]
-    spatial_rank = POOL_BACKWARD_SPATIAL_RANK[op]
+    spatial_rank = _pool_spatial_rank(op)
     if len(input_meta.shape) >= spatial_rank + 2:
         strategies.append([_ShardingPlaceholder(1)] * 4)
     # The backward is linear in grad_output, so P(sum/avg) pass through.
