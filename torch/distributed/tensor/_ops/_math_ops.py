@@ -4,6 +4,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 from typing import Any, cast
 
 import torch
@@ -1907,36 +1908,34 @@ def grid_sampler_backward_strategy(
 
 
 def _adjust_group_norm_scalars(
-    input_specs: list[DTensorSpec], schema: OpSchema
+    scalar_start: int,
+    input_specs: list[DTensorSpec],
+    schema: OpSchema,
 ) -> OpSchema:
     """Adjust N, C, HxW scalar args to local values for group_norm forward/backward.
 
-    Shared by native_group_norm and native_group_norm_backward. Both have
-    tensor args followed by N, C, HxW scalars. The scalars are derived from
-    the global input shape; we recompute them from the local shape when sharded.
+    Shared by native_group_norm and native_group_norm_backward.
+    ``input_specs[0]`` is ``input`` (forward) or ``grad_out`` (backward);
+    both have shape [N, C, *], so the local shape derivation is identical.
     """
-    input_spec = input_specs[0]
-    if input_spec.tensor_meta is None:
-        raise AssertionError("input_spec must have tensor_meta")
+    shape_spec = input_specs[0]
+    if shape_spec.tensor_meta is None:
+        raise AssertionError("shape_spec must have tensor_meta")
     local_shape, _ = compute_local_shape_and_global_offset(
-        input_spec.tensor_meta.shape,
-        input_spec.mesh,
-        input_spec.placements,
+        shape_spec.tensor_meta.shape,
+        shape_spec.mesh,
+        shape_spec.placements,
         skip_offset=True,
     )
-    # N = local_shape[0], C = local_shape[1], HxW = product of remaining dims
     n_local = local_shape[0]
     c_local = local_shape[1]
     hxw_local = 1
     for d in local_shape[2:]:
         hxw_local *= d
     args = list(schema.args_schema)
-    # Find scalar arg positions: tensor slots (DTensorSpec or None for optionals)
-    # precede N, C, HxW. Count both to find the offset.
-    num_tensor_args = sum(isinstance(a, (DTensorSpec, type(None))) for a in args)
-    args[num_tensor_args] = n_local
-    args[num_tensor_args + 1] = c_local
-    args[num_tensor_args + 2] = hxw_local
+    args[scalar_start] = n_local
+    args[scalar_start + 1] = c_local
+    args[scalar_start + 2] = hxw_local
     return OpSchema(schema.op, tuple(args), schema.kwargs_schema)
 
 
@@ -2065,7 +2064,7 @@ from torch.distributed.tensor._api import DTensor
 
 DTensor._op_dispatcher.sharding_propagator.op_to_scalar_shape_adjuster[
     aten.native_group_norm.default
-] = _adjust_group_norm_scalars
+] = partial(_adjust_group_norm_scalars, 3)
 DTensor._op_dispatcher.sharding_propagator.op_to_scalar_shape_adjuster[
     aten.native_group_norm_backward.default
-] = _adjust_group_norm_scalars
+] = partial(_adjust_group_norm_scalars, 5)

@@ -2041,49 +2041,55 @@ class DistMathOpsTest(DTensorTestBase):
         device_mesh = self.build_device_mesh()
         F = torch.nn.functional
         C, num_groups = 6, 3
-        N = self.world_size * 2
-        shape = (N, C, 8, 8)
+        replicate = [Replicate()]
 
         has_weight = affine in ("both", "weight_only")
         has_bias = affine in ("both", "bias_only")
-        w = (
-            torch.randn(C, device=self.device_type, requires_grad=True)
-            if has_weight
-            else None
-        )
-        b = (
-            torch.randn(C, device=self.device_type, requires_grad=True)
-            if has_bias
-            else None
-        )
 
-        ref_x = torch.randn(*shape, device=self.device_type, requires_grad=True)
-        dt_x = distribute_tensor(
-            ref_x.detach().clone().requires_grad_(True), device_mesh, [Shard(0)]
-        )
-        replicate = [Replicate()]
-        dt_w = distribute_tensor(w, device_mesh, replicate) if w is not None else None
-        dt_b = distribute_tensor(b, device_mesh, replicate) if b is not None else None
+        # Even and uneven batch sizes: the scalar adjuster rewrites N per-rank,
+        # so uneven sharding (ranks disagree on local N) is the interesting case.
+        for N in (self.world_size * 2, self.world_size * 2 + 1):
+            w = (
+                torch.randn(C, device=self.device_type, requires_grad=True)
+                if has_weight
+                else None
+            )
+            b = (
+                torch.randn(C, device=self.device_type, requires_grad=True)
+                if has_bias
+                else None
+            )
 
-        ref_out = F.group_norm(ref_x, num_groups, w, b)
-        ref_out.sum().backward()
+            ref_x = torch.randn(N, C, 8, 8, device=self.device_type, requires_grad=True)
+            dt_x = distribute_tensor(
+                ref_x.detach().clone().requires_grad_(True), device_mesh, [Shard(0)]
+            )
+            dt_w = (
+                distribute_tensor(w, device_mesh, replicate) if w is not None else None
+            )
+            dt_b = (
+                distribute_tensor(b, device_mesh, replicate) if b is not None else None
+            )
 
-        with CommDebugMode() as comm_mode:
-            dt_out = F.group_norm(dt_x, num_groups, dt_w, dt_b)
-            dt_out.sum().backward()
-        self.assertEqual(comm_mode.get_total_counts(), 0)
+            ref_out = F.group_norm(ref_x, num_groups, w, b)
+            ref_out.sum().backward()
 
-        self.assertEqual(dt_out.full_tensor(), ref_out)
-        self.assertTrue(dt_out.placements[0].is_shard(0))
-        self.assertEqual(dt_x.grad.full_tensor(), ref_x.grad)
-        self.assertTrue(dt_x.grad.placements[0].is_shard(0))
+            with CommDebugMode() as comm_mode:
+                dt_out = F.group_norm(dt_x, num_groups, dt_w, dt_b)
+                dt_out.sum().backward()
+            self.assertEqual(comm_mode.get_total_counts(), 0)
 
-        if has_weight:
-            self.assertEqual(dt_w.grad.full_tensor(), w.grad)
-            self.assertEqual(dt_w.grad.placements, (Partial("sum"),))
-        if has_bias:
-            self.assertEqual(dt_b.grad.full_tensor(), b.grad)
-            self.assertEqual(dt_b.grad.placements, (Partial("sum"),))
+            self.assertEqual(dt_out.full_tensor(), ref_out)
+            self.assertTrue(dt_out.placements[0].is_shard(0))
+            self.assertEqual(dt_x.grad.full_tensor(), ref_x.grad)
+            self.assertTrue(dt_x.grad.placements[0].is_shard(0))
+
+            if has_weight:
+                self.assertEqual(dt_w.grad.full_tensor(), w.grad)
+                self.assertEqual(dt_w.grad.placements, (Partial("sum"),))
+            if has_bias:
+                self.assertEqual(dt_b.grad.full_tensor(), b.grad)
+                self.assertEqual(dt_b.grad.placements, (Partial("sum"),))
 
 
 instantiate_parametrized_tests(DistMathOpsTest)
