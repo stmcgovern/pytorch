@@ -27,7 +27,12 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.common_utils import run_tests, skipIfRocm
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    skipIfRocm,
+)
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     create_local_tensor_test_class,
     DTensorTestBase,
@@ -2030,57 +2035,58 @@ class DistMathOpsTest(DTensorTestBase):
         self.assertEqual(result_no_affine.full_tensor(), expected_no_affine)
         self.assertTrue(result_no_affine.placements[0].is_shard(0))
 
-        # group_norm with batch-dim sharding -- forward + backward
-        N_bwd = self.world_size * 2
-        inp_bwd = torch.randn(N_bwd, C, H, W, device=self.device_type)
+    @with_comms
+    @parametrize("affine", ["both", "weight_only", "bias_only", "none"])
+    def test_group_norm_backward(self, affine):
+        device_mesh = self.build_device_mesh()
+        F = torch.nn.functional
+        C, num_groups = 6, 3
+        N = self.world_size * 2
+        shape = (N, C, 8, 8)
 
-        for elementwise_affine in [True, False]:
-            w = (
-                weight.clone().detach().requires_grad_(True)
-                if elementwise_affine
-                else None
-            )
-            b = (
-                bias.clone().detach().requires_grad_(True)
-                if elementwise_affine
-                else None
-            )
+        has_weight = affine in ("both", "weight_only")
+        has_bias = affine in ("both", "bias_only")
+        w = (
+            torch.randn(C, device=self.device_type, requires_grad=True)
+            if has_weight
+            else None
+        )
+        b = (
+            torch.randn(C, device=self.device_type, requires_grad=True)
+            if has_bias
+            else None
+        )
 
-            ref_inp = inp_bwd.clone().detach().requires_grad_(True)
-            dt_inp = distribute_tensor(
-                inp_bwd.clone().detach().requires_grad_(True), device_mesh, [Shard(0)]
-            )
-            dt_w = (
-                distribute_tensor(w, device_mesh, replicate) if w is not None else None
-            )
-            dt_b = (
-                distribute_tensor(b, device_mesh, replicate) if b is not None else None
-            )
+        ref_x = torch.randn(*shape, device=self.device_type, requires_grad=True)
+        dt_x = distribute_tensor(
+            ref_x.detach().clone().requires_grad_(True), device_mesh, [Shard(0)]
+        )
+        replicate = [Replicate()]
+        dt_w = distribute_tensor(w, device_mesh, replicate) if w is not None else None
+        dt_b = distribute_tensor(b, device_mesh, replicate) if b is not None else None
 
-            ref_out = F.group_norm(ref_inp, num_groups, w, b)
-            ref_out.sum().backward()
+        ref_out = F.group_norm(ref_x, num_groups, w, b)
+        ref_out.sum().backward()
 
-            with CommDebugMode() as comm_mode:
-                dt_out = F.group_norm(dt_inp, num_groups, dt_w, dt_b)
-                dt_out.sum().backward()
-            self.assertEqual(
-                comm_mode.get_total_counts(),
-                0,
-                f"Unexpected comm in group_norm bwd (affine={elementwise_affine})",
-            )
+        with CommDebugMode() as comm_mode:
+            dt_out = F.group_norm(dt_x, num_groups, dt_w, dt_b)
+            dt_out.sum().backward()
+        self.assertEqual(comm_mode.get_total_counts(), 0)
 
-            self.assertEqual(dt_out.full_tensor(), ref_out)
-            self.assertTrue(dt_out.placements[0].is_shard(0))
-            self.assertEqual(dt_inp.grad.full_tensor(), ref_inp.grad)
-            self.assertTrue(dt_inp.grad.placements[0].is_shard(0))
+        self.assertEqual(dt_out.full_tensor(), ref_out)
+        self.assertTrue(dt_out.placements[0].is_shard(0))
+        self.assertEqual(dt_x.grad.full_tensor(), ref_x.grad)
+        self.assertTrue(dt_x.grad.placements[0].is_shard(0))
 
-            if elementwise_affine:
-                self.assertEqual(dt_w.grad.full_tensor(), w.grad)
-                self.assertEqual(dt_w.grad.placements, (Partial("sum"),))
-                self.assertEqual(dt_b.grad.full_tensor(), b.grad)
-                self.assertEqual(dt_b.grad.placements, (Partial("sum"),))
+        if has_weight:
+            self.assertEqual(dt_w.grad.full_tensor(), w.grad)
+            self.assertEqual(dt_w.grad.placements, (Partial("sum"),))
+        if has_bias:
+            self.assertEqual(dt_b.grad.full_tensor(), b.grad)
+            self.assertEqual(dt_b.grad.placements, (Partial("sum"),))
 
 
+instantiate_parametrized_tests(DistMathOpsTest)
 DistMathOpsTestWithLocalTensor = create_local_tensor_test_class(
     DistMathOpsTest,
 )

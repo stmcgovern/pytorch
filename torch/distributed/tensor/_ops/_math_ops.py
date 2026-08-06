@@ -2045,10 +2045,11 @@ def group_norm_backward_strategy(
     # native_group_norm_backward(grad_out, input, mean, rstd, weight?, N, C, HxW, group, output_mask)
     #   -> (grad_input, grad_weight, grad_bias)
     weight_meta = args_schema[4]
+    output_mask = args_schema[9]
     placements: list[Placement | _ShardingPlaceholder | None] = [
-        _ShardingPlaceholder(0),  # grad_input [N,C,*]
-        Partial("sum") if weight_meta is not None else None,  # grad_weight [C]
-        Partial("sum") if weight_meta is not None else None,  # grad_bias [C]
+        _ShardingPlaceholder(0) if output_mask[0] else None,  # grad_input [N,C,*]
+        Partial("sum") if output_mask[1] else None,  # grad_weight [C]
+        Partial("sum") if output_mask[2] else None,  # grad_bias [C]
         _ShardingPlaceholder(0),  # grad_out [N,C,*]
         _ShardingPlaceholder(0),  # input [N,C,*]
         _ShardingPlaceholder(0),  # mean [N,groups]
@@ -2059,7 +2060,6 @@ def group_norm_backward_strategy(
     return [placements]
 
 
-# Register scalar adjuster for both forward and backward.
 from torch.distributed.tensor._api import DTensor
 
 
