@@ -82,7 +82,7 @@ _FullMeshStrategyFilter: TypeAlias = Callable[
 @dataclass
 class _SingleDimStrategyInfo:
     func: _SingleDimStrategyFunc
-    allow_unbacked_sharding: bool | None = field(default=None)
+    allow_unbacked_sharding: bool | None = field(default=True)
     allow_uneven_sharding: bool = field(default=False)
     full_mesh_strategy_filter: _FullMeshStrategyFilter | None = field(default=None)
     # Positions (in args_schema) of args that may live on a different mesh
@@ -336,7 +336,7 @@ class _PreparedSingleDimStrategy:
             different_mesh_args = strategy_fn.different_mesh_args
             func = strategy_fn.func
         else:
-            self.allow_unbacked_sharding = None
+            self.allow_unbacked_sharding = True
             self.allow_uneven_sharding = False
             self.full_mesh_strategy_filter = None
             different_mesh_args = None
@@ -837,7 +837,7 @@ def _expand_single_dim_strategy_to_mesh(
 def register_single_dim_strategy(
     op: torch._ops.OpOverload | list[torch._ops.OpOverload],
     schema_info: RuntimeSchemaInfo | None = None,
-    allow_unbacked_sharding: bool | None = None,
+    allow_unbacked_sharding: bool | None = True,
     allow_uneven_sharding: bool = False,
     full_mesh_strategy_filter: _FullMeshStrategyFilter | None = None,
     different_mesh_args: list[int] | None = None,

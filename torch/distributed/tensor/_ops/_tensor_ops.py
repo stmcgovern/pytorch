@@ -38,7 +38,7 @@ from torch.distributed.tensor.placement_types import (
     Replicate,
     Shard,
 )
-from torch.fx.experimental.symbolic_shapes import statically_known_true
+from torch.fx.experimental.symbolic_shapes import guard_or_false, statically_known_true
 
 
 aten = torch.ops.aten
@@ -223,7 +223,10 @@ def new_factory_single_dim_strategy(
     # propagate to the new tensor.
     input_meta = cast(TensorMeta, args_schema[0])
     output_shape = cast(Sequence[object], args_schema[1])
-    same_shape = tuple(input_meta.shape) == tuple(output_shape)
+    same_shape = len(input_meta.shape) == len(output_shape) and all(
+        guard_or_false(a == b)
+        for a, b in zip(input_meta.shape, output_shape)
+    )
 
     strategies: list[list[Placement | _ShardingPlaceholder]] = []
     for dim in range(len(input_meta.shape)):
@@ -584,10 +587,11 @@ def scatter_single_dim_strategy(
     if len(input_shape) == len(index_shape):
         for d in range(len(input_shape)):
             # Shard a non-scatter axis only when input/index/src shards align.
-            if d == scatter_dim or input_shape[d] != index_shape[d]:
+            if d == scatter_dim or not guard_or_false(input_shape[d] == index_shape[d]):
                 continue
             if src_shape is not None and (
-                len(src_shape) != len(index_shape) or src_shape[d] != index_shape[d]
+                len(src_shape) != len(index_shape)
+                or not guard_or_false(src_shape[d] == index_shape[d])
             ):
                 continue
             placement = _ShardingPlaceholder(d)
@@ -620,7 +624,7 @@ def scatter_add_single_dim_strategy(
     strategies: list[list[Placement | _ShardingPlaceholder]] = []
     if len(input_shape) == len(index_shape):
         for d in range(len(input_shape)):
-            if d != scatter_dim and input_shape[d] == index_shape[d]:
+            if d != scatter_dim and guard_or_false(input_shape[d] == index_shape[d]):
                 placement = _ShardingPlaceholder(d)
                 strategies.append([placement, placement, placement, placement])
     return strategies
@@ -649,7 +653,7 @@ def gather_single_dim_strategy(
     if (
         len(input_shape) > 0
         and gather_dim < len(index_shape)
-        and index_shape[gather_dim] == 1
+        and guard_or_false(index_shape[gather_dim] == 1)
     ):
         mask_partial = _MaskPartial(offset_shape=input_shape, offset_dim=gather_dim)
         strategies.append([mask_partial, Shard(gather_dim), mask_partial])
@@ -1063,7 +1067,7 @@ def index_put_single_dim_strategy(
 
         if values_tensor_dim < 0:
             values_placement: Placement | _ShardingPlaceholder = Replicate()
-        elif values_meta.shape[values_tensor_dim] == 1:
+        elif guard_or_false(values_meta.shape[values_tensor_dim] == 1):
             values_placement = Replicate()
         else:
             values_placement = _ShardingPlaceholder(values_tensor_dim)

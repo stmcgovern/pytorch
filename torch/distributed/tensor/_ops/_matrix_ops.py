@@ -155,7 +155,7 @@ def gen_single_dim_einsum_strategies(
                 broadcast_dims_map.append(-1)
             else:
                 bias_dim_idx = i - pad_size
-                if bias_shape[bias_dim_idx] == 1:
+                if guard_or_false(bias_shape[bias_dim_idx] == 1):
                     # Size-1 dimension (broadcasts)
                     broadcast_dims_map.append(-1)
                 else:
