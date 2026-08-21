@@ -252,6 +252,53 @@ def is_tensor_shardable(
     return True
 
 
+def _shard_lower_bounds(
+    shape: Sequence[int],
+    spec: DTensorSpec,
+) -> list[int] | None:
+    """Compute the minimum size each dimension needs for the given sharding.
+
+    Returns None if any placement references a dimension beyond the shape's rank.
+    """
+    bounds: list[int] = [1] * len(shape)
+    for i, placement in enumerate(spec.placements):
+        if _is_shard_like(placement):
+            shard_dim = placement.dim
+            if shard_dim >= len(shape):
+                return None
+            bounds[shard_dim] *= spec.mesh.size(i)
+            if isinstance(placement, _StridedShard):
+                bounds[shard_dim] *= int(placement.split_factor)
+    return bounds
+
+
+def assert_unbacked_sharding_valid(
+    shape: Sequence[int],
+    spec: DTensorSpec,
+) -> None:
+    """Emit runtime assertions for unbacked dims in a CHOSEN strategy.
+
+    Must be called after strategy selection, not during enumeration.
+    Calling during enumeration would over-constrain the graph with
+    assertions for strategies that were explored but not chosen.
+    """
+    from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+
+    lower_bounds = _shard_lower_bounds(shape, spec)
+    if lower_bounds is None:
+        return
+
+    for d, lb in enumerate(lower_bounds):
+        if lb <= 1:
+            continue
+        size = shape[d]
+        if not isinstance(size, torch.SymInt):
+            continue
+        if not free_unbacked_symbols(size.node.expr):
+            continue
+        torch._check(size >= lb)
+
+
 def is_tensor_evenly_shardable(shape: Sequence[int], spec: DTensorSpec) -> bool:
     """Check if the shape is evenly shardable according to the spec."""
     # number of shards in each tensor dimension

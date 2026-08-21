@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DeviceMesh, distribute_tensor, DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._ops.utils import (
+    assert_unbacked_sharding_valid,
     is_tensor_evenly_shardable,
     is_tensor_shardable,
 )
@@ -2005,6 +2006,65 @@ class TestIsTensorShardable(LocalTensorTestBase):
         spec = self._create_spec((4, 2), [Shard(0), _StridedShard(0, split_factor=2)])
         # not shardable now because of the split_factor
         self.assertFalse(is_tensor_shardable([8, 8], spec))
+
+    def test_is_tensor_shardable_unbacked(self):
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
+        with fake_mode:
+            u0 = fake_mode.shape_env.create_unbacked_symint()
+
+        spec = self._create_spec((4,), [Shard(0)])
+
+        # None (old default): raises because bool() on symbolic expression fails
+        from torch.fx.experimental.symbolic_shapes import GuardOnDataDependentSymNode
+
+        with self.assertRaises(GuardOnDataDependentSymNode):
+            is_tensor_shardable([u0], spec, allow_unbacked_sharding=None)
+
+        # True (new default): assumes shardable, no assertion
+        self.assertTrue(is_tensor_shardable([u0], spec, allow_unbacked_sharding=True))
+
+        # False: assumes not shardable
+        self.assertFalse(is_tensor_shardable([u0], spec, allow_unbacked_sharding=False))
+
+    def test_assert_unbacked_sharding_valid(self):
+        import sympy
+
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
+        with fake_mode:
+            u0 = fake_mode.shape_env.create_unbacked_symint()
+
+        spec = self._create_spec((4,), [Shard(0)])
+        n_before = fake_mode.shape_env.num_deferred_runtime_asserts
+
+        # Should emit torch._check(u0 >= 4) without raising
+        assert_unbacked_sharding_valid([u0, 8], spec)
+
+        # Exactly one new deferred assertion was recorded
+        n_after = fake_mode.shape_env.num_deferred_runtime_asserts
+        self.assertEqual(n_after - n_before, 1)
+
+        # The assertion says u0 >= 4 (mesh_size=4 on dim 0)
+        all_asserts = [
+            ra
+            for ras in fake_mode.shape_env.deferred_runtime_asserts.values()
+            for ra in ras
+        ]
+        new_assert = all_asserts[-1]
+        u0_sym = u0.node.expr
+        # sympy canonicalizes Ge(u0, 4) to Le(4, u0)
+        expected = sympy.Le(4, u0_sym)
+        self.assertEqual(new_assert.expr, expected)
+
+        # Concrete dim (8) should NOT emit an assertion
+        n_before2 = fake_mode.shape_env.num_deferred_runtime_asserts
+        assert_unbacked_sharding_valid([8, 8], spec)
+        self.assertEqual(fake_mode.shape_env.num_deferred_runtime_asserts, n_before2)
 
     def test_is_tensor_evenly_shardable(self):
         spec = self._create_spec((4,), [Shard(0)])

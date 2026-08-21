@@ -45,6 +45,17 @@ aten = torch.ops.aten
 log = logging.getLogger(__name__)
 
 
+def _emit_unbacked_sharding_guards(
+    tensor_meta: TensorMeta | None,
+    spec: DTensorSpec,
+) -> None:
+    """Emit runtime guards for unbacked dims in a chosen sharding strategy."""
+    if tensor_meta is not None:
+        from torch.distributed.tensor._ops.utils import assert_unbacked_sharding_valid
+
+        assert_unbacked_sharding_valid(tensor_meta.shape, spec)
+
+
 def _propagate_use_strided_shard_flag(
     op_strategy: OpStrategy,
     op_schema: OpSchema,
@@ -835,6 +846,7 @@ class ShardingPropagator:
                     )
                     if input_spec.placements != desired_spec.placements:
                         needs_redistribute = True
+                    _emit_unbacked_sharding_guards(input_spec.tensor_meta, desired_spec)
 
                 suggestion_schema = None
                 if needs_redistribute:
@@ -952,6 +964,9 @@ class ShardingPropagator:
                             )
                             if arg_spec.placements != expected_input_spec.placements:
                                 needs_redistribute = True
+                            _emit_unbacked_sharding_guards(
+                                arg_spec.tensor_meta, expected_input_spec
+                            )
                             expected_input_spec_list.append(expected_input_spec)
                         suggestion_args.append(
                             tuple(expected_input_spec_list)
@@ -971,6 +986,9 @@ class ShardingPropagator:
                         )
                         if arg.placements != expected_input_spec.placements:
                             needs_redistribute = True
+                        _emit_unbacked_sharding_guards(
+                            arg.tensor_meta, expected_input_spec
+                        )
                         suggestion_args.append(expected_input_spec)
                         tensor_or_list_tensor_arg_idx += 1
                     else:

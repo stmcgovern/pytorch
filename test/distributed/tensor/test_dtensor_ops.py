@@ -2,10 +2,14 @@
 # Owner(s): ["oncall: distributed"]
 
 import copy
+import logging
 import random
 import re
 import threading
 import warnings
+
+
+log = logging.getLogger(__name__)
 
 import torch
 import torch._dynamo
@@ -750,41 +754,27 @@ class TestLocalDTensorOps(TestDTensorOps):
 # This list only contains ops NOT in ops_dde_xfail - those are base tensor issues.
 ops_unbacked_dtensor_dde = {
     xfail("__getitem__"),
-    xfail("__rmatmul__"),
+    xfail("_batch_norm_with_update"),
+    xfail("_native_batch_norm_legit"),
     xfail("_segment_reduce", "lengths"),
-    xfail("_segment_reduce", "offsets"),
-    xfail("_unsafe_masked_index"),
-    xfail("addr"),
-    xfail("alias_copy"),
-    xfail("aminmax"),
     xfail("argwhere"),
     xfail("as_strided"),
     xfail("as_strided", "partial_views"),
-    xfail("as_strided_copy"),
-    xfail("block_diag"),
     skip("broadcast_to"),
     xfail("cartesian_prod"),
     xfail("combinations"),
+    xfail("constant_pad_nd"),
     xfail("cumprod"),
-    xfail("dist"),
-    xfail("fill"),
     xfail("flatten"),
     xfail("float"),
-    xfail("index_add"),
-    xfail("index_copy"),
+    xfail("linalg.lu"),
     xfail("linalg.lu_factor"),
-    xfail("masked_fill"),
-    xfail("masked_scatter"),
-    xfail("masked_select"),
+    xfail("linalg.lu_factor_ex"),
+    xfail("lu"),
+    xfail("lu_unpack"),
     xfail("matmul"),
-    xfail("mv"),
     xfail("narrow"),
-    xfail("narrow_copy"),
-    xfail("new_empty"),
-    xfail("new_empty_strided"),
-    xfail("new_full"),
-    xfail("new_ones"),
-    xfail("new_zeros"),
+    xfail("native_batch_norm"),
     xfail("nn.functional.batch_norm"),
     xfail("nn.functional.conv1d"),
     xfail("nn.functional.conv2d"),
@@ -792,35 +782,27 @@ ops_unbacked_dtensor_dde = {
     xfail("nn.functional.conv_transpose1d"),
     xfail("nn.functional.conv_transpose2d"),
     xfail("nn.functional.conv_transpose3d"),
-    xfail("nn.functional.glu"),
     xfail("nn.functional.interpolate", "nearest"),
     xfail("nn.functional.interpolate", "nearest-exact"),
     xfail("nn.functional.linear"),
-    xfail("nn.functional.logsigmoid"),
-    xfail("nn.functional.multilabel_soft_margin_loss"),
-    xfail("nn.functional.soft_margin_loss"),
-    xfail("nn.functional.triplet_margin_loss"),
-    xfail("nn.functional.triplet_margin_with_distance_loss"),
+    xfail("nn.functional.pad", "constant"),
     xfail("nn.functional.upsample_nearest"),
-    xfail("nonzero_static"),
-    xfail("permute_copy"),
     xfail("prod"),
     xfail("quantile"),
     xfail("ravel"),
     xfail("reshape"),
     xfail("reshape_as"),
-    xfail("rsub"),
-    xfail("rot90"),
     xfail("scatter"),
-    xfail("squeeze_copy"),
-    xfail("std_mean"),
-    xfail("transpose_copy"),
     xfail("unflatten"),
-    xfail("unsqueeze_copy"),
-    xfail("vdot"),
     xfail("view"),
     xfail("view_as"),
-    xfail("torch.ops.aten._scaled_dot_product_flash_attention_for_cpu"),
+}
+
+# Ops that produce uninitialized memory -- value comparison is meaningless.
+ops_unbacked_dtensor_skip_correctness = {
+    skip("empty_like"),
+    skip("new_empty"),
+    skip("new_empty_strided"),
 }
 
 
@@ -876,6 +858,7 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         Same as parent but:
         1. Marks DTensor dimensions as unbacked before running
         2. Wraps the op in @torch.compile(backend="eager", fullgraph=True)
+        3. Compares compiled output against the non-DTensor reference
         """
         to_dtensor = DTensorConverter(self.mesh, args, kwargs)
 
@@ -892,9 +875,19 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         def to_replicate(e: object) -> object:
             return e.full_tensor() if isinstance(e, DTensor) else e
 
+        def _all_replicate(tree):
+            return all(
+                (not isinstance(e, DTensor))
+                or all(isinstance(p, Replicate) for p in e.placements)
+                for e in pytree.tree_leaves(tree)
+            )
+
+        total_placements = 0
+        guard_failures = 0
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for dtensor_args, dtensor_kwargs in to_dtensor:
+                total_placements += 1
                 try:
                     if not to_dtensor.successful():
                         raise RuntimeError(
@@ -916,13 +909,45 @@ class TestUnbackedDTensorOps(TestDTensorOps):
                     def compiled_func(*a, **kw):
                         return func(*a, **kw)
 
-                    compiled_func(*dtensor_args, **dtensor_kwargs)
+                    dtensor_rs = compiled_func(*dtensor_args, **dtensor_kwargs)
 
+                    flat_rs_leaves = pytree.tree_leaves(dtensor_rs)
+                    if any(
+                        isinstance(e, torch.Tensor) and e.numel() == 0
+                        for e in flat_rs_leaves
+                    ):
+                        continue
+
+                    all_replicate = _all_replicate(
+                        (dtensor_args, dtensor_kwargs)
+                    ) and _all_replicate(dtensor_rs)
+                    dtensor_rs = tree_map(to_replicate, dtensor_rs)
+                    dtensor_rs = concat_res_if_necessary(func, dtensor_rs)
+                    if all_replicate:
+                        self.assert_ref_dtensor_equal(dtensor_rs, rs)
+                    else:
+                        flat_dt = pytree.tree_leaves(dtensor_rs)
+                        flat_ref = pytree.tree_leaves(rs)
+                        for dt_r, ref_r in zip(flat_dt, flat_ref):
+                            if not isinstance(ref_r, torch.Tensor):
+                                continue
+                            self.assertEqual(dt_r.shape, ref_r.shape)
+                            self.assertEqual(dt_r.dtype, ref_r.dtype)
+
+                except torch._dynamo.exc.Unsupported:
+                    guard_failures += 1
+                    continue
                 except Exception as e:
                     raise RuntimeError(
                         f"{str(e)}\n\nFailed to run: {resolve_name(func)}, "
                         f"with (*{dtensor_args}, **{dtensor_kwargs})"
                     ) from e
+
+        if guard_failures > 0 and guard_failures >= total_placements:
+            raise RuntimeError(
+                f"All {total_placements} placement(s) for "
+                f"{resolve_name(func)} hit unbacked guard failures"
+            )
         return rs
 
     @suppress_warnings
@@ -930,6 +955,7 @@ class TestUnbackedDTensorOps(TestDTensorOps):
     @skipOps(
         ops_dde_xfail
         | ops_unbacked_dtensor_dde
+        | ops_unbacked_dtensor_skip_correctness
         | dtensor_fails_no_strategy
         | ops_unbacked_skip,
     )

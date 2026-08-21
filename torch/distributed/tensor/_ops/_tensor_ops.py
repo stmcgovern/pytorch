@@ -224,8 +224,7 @@ def new_factory_single_dim_strategy(
     input_meta = cast(TensorMeta, args_schema[0])
     output_shape = cast(Sequence[object], args_schema[1])
     same_shape = len(input_meta.shape) == len(output_shape) and all(
-        guard_or_false(a == b)
-        for a, b in zip(input_meta.shape, output_shape)
+        guard_or_false(a == b) for a, b in zip(input_meta.shape, output_shape)
     )
 
     strategies: list[list[Placement | _ShardingPlaceholder]] = []

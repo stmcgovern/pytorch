@@ -220,7 +220,7 @@ class DecompShardingStrategy:
             except NotImplementedError:
                 return None
             except GuardOnDataDependentSymNode:
-                return None
+                continue
             except (RuntimeError, KeyError, IndexError):
                 # TODO(pianpwk): RuntimeError is raised when redistribution is detected; switch to a custom error type
                 # Runtime/KeyError/IndexError can also occur in view ops
