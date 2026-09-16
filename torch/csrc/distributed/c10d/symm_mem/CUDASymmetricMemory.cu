@@ -194,9 +194,10 @@ void CUDASymmetricMemory::barrier(int channel, size_t timeout_ms) {
   c10::cuda::CUDAGuard device_guard(local_device_idx_);
   GroupStreamGuard stream_guard(pai_->group_name_, pg);
   if (get_multicast_ptr() != nullptr) {
+    // Channel c's arrival counter is the word buffer[-1 - c], see alloc().
     multimem_barrier_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
-        static_cast<uint32_t*>(pai_->signal_pads_[rank_]),
-        static_cast<uint32_t*>(pai_->mc_signal_pad_addr_),
+        static_cast<uint32_t*>(pai_->buffers_[rank_]) - 1 - channel,
+        static_cast<uint32_t*>(pai_->mc_addr_) - 1 - channel,
         channel,
         rank_,
         world_size_,
@@ -335,10 +336,13 @@ void* CUDASymmetricMemoryAllocator::alloc(
     size_t size,
     int device_idx,
     const std::optional<std::string>& group_name) {
-  // buffer_offset is the signal pad size rounded up to signal_pad_alignment so
-  // the data buffer stays aligned.
-  size_t buffer_offset =
-      at::round_up(get_signal_pad_size(), signal_pad_alignment);
+  // The multimem barrier's arrival counters sit just below the data buffer,
+  // one word per channel. A channel takes at least one word of the pad, so
+  // reserving twice the pad keeps the counters clear of it. buffer_offset is
+  // rounded up to signal_pad_alignment so the data buffer stays aligned.
+  size_t buffer_offset = at::round_up(
+      2 * at::round_up(get_signal_pad_size(), sizeof(uint32_t)),
+      signal_pad_alignment);
   size_t block_size = buffer_offset + at::round_up(size, 16UL);
   c10::cuda::CUDAGuard guard(device_idx);
   device_idx = static_cast<int>(guard.current_device().index());

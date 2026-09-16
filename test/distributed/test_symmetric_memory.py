@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from unittest import skipIf, skipUnless
@@ -429,6 +430,99 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         signal_pad.fill_(42)
         t.fill_(0)
         self.assertTrue(signal_pad.eq(42).all())
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_signal_pad_mailbox_layout(self) -> None:
+        """put_signal() sets the word world_size * channel + src of the
+        destination's pad. Kernels outside PyTorch, such as kraken's
+        symm_mem_barrier, index the pad this way, so the layout must not move.
+        """
+        self._init_process()
+        t = symm_mem.empty(64, device=self.device)
+        hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
+        channel = 3
+        src = (self.rank - 1) % self.world_size
+        hdl.put_signal(dst_rank=(self.rank + 1) % self.world_size, channel=channel)
+        torch.cuda.synchronize()
+        dist.barrier()
+        pad = hdl.get_signal_pad(self.rank).view(torch.int32)
+        set_words = pad.nonzero().flatten().tolist()
+        hdl.wait_signal(src_rank=src, channel=channel)
+        torch.cuda.synchronize()
+
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, set_words)
+        expected = [
+            [self.world_size * channel + (r - 1) % self.world_size]
+            for r in range(self.world_size)
+        ]
+        self.assertEqual(gathered, expected)
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_multimem_barrier_ignores_pending_signal(self) -> None:
+        """A pending signal must not count as an arrival for barrier().
+
+        While the multimem barrier kept its arrival counter in the mailbox from
+        source rank 0, a pending put_signal counted as one arrival: barrier()
+        returned before every rank had reached it, and the barrier's reset then
+        erased the signal. Both operations completed, so nothing reported it.
+        """
+        self._init_process()
+
+        t = symm_mem.empty(1024, dtype=torch.float32, device=self.device)
+        hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
+        if hdl.multicast_ptr == 0:
+            self.skipTest("barrier() takes the multimem path only with multicast")
+
+        channel = 1
+        delay_s = 2.0
+
+        dist.barrier()
+        if self.rank == 0:
+            hdl.put_signal(dst_rank=1, channel=channel)
+            torch.cuda.synchronize()
+        # Pin the interleaving: the signal is in place before any barrier runs,
+        # so the outcome does not depend on a race.
+        dist.barrier()
+
+        if self.rank == 0:
+            time.sleep(delay_s)
+        started = time.perf_counter()
+        hdl.barrier(channel=channel)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+
+        # Consume the signal so the pad is clean for the tests that follow.
+        if self.rank == 1:
+            hdl.wait_signal(src_rank=0, channel=channel)
+            torch.cuda.synchronize()
+
+        # Gather before asserting. A rank that raised here would skip the
+        # collectives below and hang its peers until the watchdog aborted them,
+        # which would take the rest of the class down and hide this message.
+        timings = [0.0] * self.world_size
+        dist.all_gather_object(timings, elapsed)
+        dist.barrier()
+
+        # Rank 0 does not arrive until delay_s, so no other rank's barrier can
+        # complete before then. Rank 1 owns the slot the counter used to alias;
+        # any further ranks are the control and must wait too.
+        early = [r for r in range(1, self.world_size) if timings[r] <= delay_s / 2]
+        if early:
+            # fail() rather than assertEqual: assertEqual on sequences reports a
+            # length mismatch and discards the message that says what happened.
+            seen = ", ".join(f"rank {r}: {t:.2f}s" for r, t in enumerate(timings))
+            self.fail(
+                f"barrier(channel={channel}) returned on rank(s) {early} before "
+                f"rank 0 arrived at {delay_s:.1f}s ({seen}). A pending "
+                f"put_signal was counted as a barrier arrival."
+            )
 
     @skipIf(
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"

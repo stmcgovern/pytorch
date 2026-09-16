@@ -108,6 +108,19 @@ __device__ __forceinline__ void wait_signal(uint32_t* addr) {
     ;
 }
 
+// Signal pad layout: channel c holds one mailbox word per source rank, at
+// world_size * c + src. Kernels outside PyTorch index the pad this way too, so
+// it does not change; state of PyTorch's own goes outside the pad. Every
+// mailbox access goes through this function; open-coding the arithmetic is how
+// the multimem barrier's counter came to share a word with a mailbox.
+__device__ __forceinline__ uint32_t* signal_mailbox(
+    uint32_t* pad,
+    size_t world_size,
+    size_t channel,
+    size_t src) {
+  return pad + world_size * channel + src;
+}
+
 // Validates the channel argument for barrier(), put_signal() and
 // wait_signal(). Shared by the CUDA and NCCL symmetric-memory backends.
 // ``signal_pad_size`` is passed in (rather than calling get_signal_pad_size()
@@ -147,7 +160,8 @@ inline void check_channel(int channel, int world_size, size_t signal_pad_size) {
       return;
     }
     auto put_success = try_put_signal<std::memory_order_release>(
-        signal_pads[target_rank] + world_size * channel + rank, timeout_ms);
+        signal_mailbox(signal_pads[target_rank], world_size, channel, rank),
+        timeout_ms);
     if (!put_success) {
       printf(
           "[FATAL] SymmetricMemory::barrier: rank %d failed to send signal "
@@ -159,7 +173,8 @@ inline void check_channel(int channel, int world_size, size_t signal_pad_size) {
       trap();
     }
     auto wait_success = try_wait_signal<std::memory_order_acquire>(
-        signal_pads[rank] + world_size * channel + target_rank, timeout_ms);
+        signal_mailbox(signal_pads[rank], world_size, channel, target_rank),
+        timeout_ms);
     if (!wait_success) {
       printf(
           "[FATAL] SymmetricMemory::barrier: rank %d failed to receive signal "
@@ -228,19 +243,20 @@ __device__ __forceinline__ bool wait_wrap_ge_u32(
   return true;
 }
 
+// `local_counter` and `mc_counter` are this channel's arrival counter, through
+// this rank's mapping and the multicast one. It is a word of its own, outside
+// the signal pad, so a pending signal is never counted as an arrival.
 [[maybe_unused]] static __global__ void multimem_barrier_kernel(
-    uint32_t* local_signal_pad,
-    uint32_t* mc_signal_pad,
+    uint32_t* local_counter,
+    uint32_t* mc_counter,
     int channel,
     int rank,
     int world_size,
     size_t timeout_ms) {
   if (threadIdx.x == 0) {
-    auto local_flag_ptr = local_signal_pad + world_size * channel;
-    auto mc_flag_ptr = mc_signal_pad + world_size * channel;
-    multimem_red_add1_release_u32(mc_flag_ptr);
+    multimem_red_add1_release_u32(mc_counter);
     auto wait_success = wait_wrap_ge_u32(
-        local_flag_ptr, static_cast<uint32_t>(world_size), timeout_ms);
+        local_counter, static_cast<uint32_t>(world_size), timeout_ms);
     if (!wait_success) {
       printf(
           "[FATAL] SymmetricMemory::barrier: rank %d failed to observe "
@@ -251,7 +267,7 @@ __device__ __forceinline__ bool wait_wrap_ge_u32(
       trap();
     }
     red_sub_relaxed_sys_u32(
-        local_flag_ptr, static_cast<uint32_t>(world_size));
+        local_counter, static_cast<uint32_t>(world_size));
   }
 }
 
@@ -268,7 +284,8 @@ __device__ __forceinline__ bool wait_wrap_ge_u32(
     size_t timeout_ms) {
   if (threadIdx.x == 0) {
     bool success = try_put_signal<std::memory_order_release>(
-        signal_pads[dst_rank] + world_size * channel + rank, timeout_ms);
+        signal_mailbox(signal_pads[dst_rank], world_size, channel, rank),
+        timeout_ms);
     if (!success) {
       printf(
           "[FATAL] SymmetricMemory::put_signal: rank %d failed to send signal "
@@ -293,7 +310,8 @@ __device__ __forceinline__ bool wait_wrap_ge_u32(
     size_t timeout_ms) {
   if (threadIdx.x == 0) {
     bool success = try_wait_signal<std::memory_order_acquire>(
-        signal_pads[rank] + world_size * channel + src_rank, timeout_ms);
+        signal_mailbox(signal_pads[rank], world_size, channel, src_rank),
+        timeout_ms);
     if (!success) {
       printf(
           "[FATAL] SymmetricMemory::wait_signal: rank %d failed to receive signal "
@@ -339,17 +357,17 @@ __device__ __forceinline__ void sync_remote_blocks(
     auto target_rank = threadIdx.x;
     if constexpr (hasPrevMemAccess) {
       put_signal<std::memory_order_release>(
-          signal_pads[target_rank] + blockIdx.x * world_size + rank);
+          signal_mailbox(signal_pads[target_rank], world_size, blockIdx.x, rank));
     } else {
       put_signal<std::memory_order_relaxed>(
-          signal_pads[target_rank] + blockIdx.x * world_size + rank);
+          signal_mailbox(signal_pads[target_rank], world_size, blockIdx.x, rank));
     }
     if constexpr (hasSubsequentMemAccess) {
       wait_signal<std::memory_order_acquire>(
-          signal_pads[rank] + blockIdx.x * world_size + target_rank);
+          signal_mailbox(signal_pads[rank], world_size, blockIdx.x, target_rank));
     } else {
       wait_signal<std::memory_order_relaxed>(
-          signal_pads[rank] + blockIdx.x * world_size + target_rank);
+          signal_mailbox(signal_pads[rank], world_size, blockIdx.x, target_rank));
     }
   }
 };
