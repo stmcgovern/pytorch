@@ -316,6 +316,12 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         signal_pad[0] = 42
         self.assertEqual(signal_pad[0].item(), 42)
 
+        # Leave the pad zero-filled, as NOTE [symmetric memory signal pad]
+        # requires. The pad belongs to the process group, so residue here is
+        # read by every later synchronization on it, not just this allocation.
+        signal_pad.fill_(0)
+        torch.cuda.synchronize()
+
         # Restore original settings
         symm_mem.set_signal_pad_size(original_size)
 
@@ -430,6 +436,12 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         signal_pad.fill_(42)
         t.fill_(0)
         self.assertTrue(signal_pad.eq(42).all())
+
+        # Leave the pad zero-filled, as NOTE [symmetric memory signal pad]
+        # requires. The toggle protocol of barrier(), put_signal() and
+        # wait_signal() expects 0 or 1, so residue of 42 here wedges them.
+        signal_pad.fill_(0)
+        torch.cuda.synchronize()
 
     @skipIf(
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
