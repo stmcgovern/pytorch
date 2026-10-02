@@ -31,32 +31,19 @@ namespace symmetric_memory {
 static StoreExchange storeExchange = StoreExchange("NCCLAllocation");
 
 struct NCCLAllocation {
-  // Combined ncclMemAlloc region. Layout (signal pad first):
-  //   [0, buffer_offset)                            - signal pad
-  //   [buffer_offset, buffer_offset + buffer_size)  - user data buffer
-  // buffer_offset equals the signal pad size (already 16-aligned). alloc_base is
-  // the ncclMemAlloc base (== signal pad base); alloc() hands back
-  // `alloc_base + buffer_offset` (the data buffer).
+  // The ncclMemAlloc base, which alloc() hands back.
   void* alloc_base;
   // Size of the user-visible data buffer in bytes, as requested by alloc().
   size_t buffer_size;
-  // Byte offset from alloc_base to the start of the user buffer; the signal pad
-  // occupies [0, buffer_offset).
-  size_t buffer_offset;
   int device_idx;
   std::mutex mutex;
   // Map of group name to peer alloc info
   ska::flat_hash_map<std::string, c10::intrusive_ptr<NCCLPeerAllocInfo>>
       peer_alloc_infos_;
 
-  NCCLAllocation(
-      void* alloc_base,
-      size_t buffer_size,
-      size_t buffer_offset,
-      int device_idx)
+  NCCLAllocation(void* alloc_base, size_t buffer_size, int device_idx)
       : alloc_base(alloc_base),
         buffer_size(buffer_size),
-        buffer_offset(buffer_offset),
         device_idx(device_idx) {}
 
   ~NCCLAllocation() {
@@ -88,10 +75,7 @@ using NCCLSymmMemKeysByAlloc =
 
 bool pointer_in_allocation(void* ptr, const NCCLAllocation& allocation) {
   auto ptr_int = reinterpret_cast<uintptr_t>(ptr);
-  // The data buffer starts `buffer_offset` bytes into the allocation (past the
-  // signal pad); only data-region pointers belong to this allocation.
-  auto buffer_ptr = reinterpret_cast<uintptr_t>(allocation.alloc_base) +
-      allocation.buffer_offset;
+  auto buffer_ptr = reinterpret_cast<uintptr_t>(allocation.alloc_base);
   return ptr_int >= buffer_ptr && ptr_int < buffer_ptr + allocation.buffer_size;
 }
 
@@ -114,11 +98,7 @@ NCCLAllocMap::iterator find_allocation_covering(
     return alloc_it;
   }
   // `ptr` is not an allocation key (a MemPool hands out interior pointers), so
-  // scan for the allocation whose [buffer, buffer + size) range covers it. We
-  // deliberately do not reconstruct the key from the process-global pad size:
-  // get_signal_pad_size() may have changed via set_signal_pad_size() since
-  // this allocation was created, whereas the scan uses each allocation's own
-  // stored buffer_offset.
+  // scan for the allocation whose [buffer, buffer + size) range covers it.
   // TODO: this linear std::find_if is O(n) in the number of live allocations.
   // Make it O(log n) by switching NCCLAllocMap to an ordered map and using
   // upper_bound to find the covering allocation.
@@ -130,24 +110,15 @@ NCCLAllocMap::iterator find_allocation_covering(
 // Before NCCL 2.29, we can use device-side APIs to get peer pointers.
 #if NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0)
 #ifdef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
-// Fill both peer pointer arrays in a single kernel launch. For each peer,
-// NCCL returns the window base (== signal pad base); the data buffer pointer
-// is derived as `base + buffer_offset`, mirroring the host-side layout.
 static __global__ void build_ptr_dev(
   ncclWindow_t  handle,
-  size_t  buffer_offset,  // data buffer offset; signal pad occupies [0, buffer_offset)
   void**  buffers,        // out: peer buffer pointers
-  void**  signal_pads,    // out: peer signal pad pointers
   int  world_size)
 {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = blockDim.x * gridDim.x;
   for (int peer = tid; peer < world_size; peer += stride) {
-      void* buf = ncclGetLsaPointer(handle, 0, peer);
-      signal_pads[peer] = buf;
-      buffers[peer] = buf == nullptr
-          ? nullptr
-          : static_cast<char*>(buf) + buffer_offset;
+      buffers[peer] = ncclGetLsaPointer(handle, 0, peer);
   }
 }
 #endif // NCCL_HAS_SYMMEM_DEVICE_SUPPORT
@@ -159,7 +130,6 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
       NCCLAllocation* allocation,
       std::string group_name)
       : buffer_size_(allocation->buffer_size),
-        buffer_offset_(allocation->buffer_offset),
         device_idx_(allocation->device_idx),
         group_name_(std::move(group_name))
   {
@@ -184,15 +154,7 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
         "been eagerly initialized by filling `device_id` in the "
         "`init_process_group` call.");
 
-    // Register a single window over the combined signal pad + buffer region.
-    // Layout inside the registration (signal pad first):
-    //   [0, signal_pad_size)                          - signal pad
-    //   [buffer_offset_, buffer_offset_ + buffer)     - user data buffer
-    // The single registration sidesteps NCCL's window-alignment requirement
-    // for the data sub-region: only the base pointer (returned by
-    // ncclMemAlloc, already granularity-aligned) is registered.
-    const size_t aligned_buffer_size = at::round_up(buffer_size_, 16UL);
-    const size_t total_size = buffer_offset_ + aligned_buffer_size;
+    const size_t total_size = at::round_up(buffer_size_, 16UL);
     C10D_NCCL_CHECK(
       ncclCommWindowRegister(comm_, allocation->alloc_base, total_size, &combined_win_, NCCL_WIN_COLL_SYMMETRIC),
       c10::str(
@@ -212,18 +174,15 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
     const size_t arr_size = sizeof(void*) * world_size_;
     buffers_dev_ = reinterpret_cast<void**>(
         c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
-    signal_pads_dev_ = reinterpret_cast<void**>(
-        c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
     buffers_.resize(world_size_);
-    signal_pads_.resize(world_size_);
 
 #if NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0)
-    // Lack of host-side API to get peer pointers, so a kernel writes both
-    // peer arrays at once and copies the results to host.
+    // Lack of host-side API to get peer pointers, so a kernel writes them and
+    // copies the results to host.
     int threads = std::min(128, world_size_);
     auto stream = at::cuda::getCurrentCUDAStream();
     build_ptr_dev<<<1, threads, 0, stream>>>(
-        combined_win_, buffer_offset_, buffers_dev_, signal_pads_dev_, world_size_);
+        combined_win_, buffers_dev_, world_size_);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     C10_CUDA_CHECK(cudaStreamSynchronize(stream));
     C10_CUDA_CHECK(cudaMemcpy(
@@ -231,49 +190,28 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
       buffers_dev_,  // src (device)
       arr_size,
       cudaMemcpyDeviceToHost));
-    C10_CUDA_CHECK(cudaMemcpy(
-      signal_pads_.data(),  // dst (host)
-      signal_pads_dev_,  // src (device)
-      arr_size,
-      cudaMemcpyDeviceToHost));
 #else
   // Starting from NCCL 2.29, we can use host-side APIs to get peer pointers.
-  // ncclGetPeerDevicePointer returns each peer's window base, which is the
-  // signal pad base (the signal pad is at the front of the window).
   for (int i = 0; i < world_size_; i++) {
     // If peer is not accessible within LSA domain, `ncclGetPeerDevicePointer`
     // returns nullptr.
     C10D_NCCL_CHECK(
-      ncclGetPeerDevicePointer(combined_win_, 0, i, &signal_pads_[i]),
+      ncclGetPeerDevicePointer(combined_win_, 0, i, &buffers_[i]),
       "ncclGetPeerDevicePointer failed");
-  }
-  // Derive each peer's data buffer pointer from its window base; all ranks
-  // share the same buffer_offset_ so we don't need to ask NCCL separately.
-  for (int i = 0; i < world_size_; i++) {
-    buffers_[i] = signal_pads_[i] == nullptr
-        ? nullptr
-        : static_cast<char*>(signal_pads_[i]) + buffer_offset_;
   }
   C10_CUDA_CHECK(cudaMemcpy(
     buffers_dev_,  // dst (device)
     buffers_.data(),  // src (host)
     arr_size,
     cudaMemcpyHostToDevice));
-  C10_CUDA_CHECK(cudaMemcpy(
-      signal_pads_dev_,  // dst (device)
-      signal_pads_.data(),  // src (host)
-      arr_size,
-      cudaMemcpyHostToDevice));
 
   // Starting from NCCL 2.29, we can use `ncclGetLsaMultimemDevicePointer`
   // to get multicast address.
   void* mc_addr = nullptr;
   // Skip CHECK on purpose to improve fault tolerance since some machine's
   // Fabric Manager may be in bad NVLink Sharp state.
-  // Pass buffer_offset_ as the window offset so the returned multicast pointer
-  // already points at the data buffer (past the signal pad); no manual add.
-  if (ncclGetLsaMultimemDevicePointer(
-          combined_win_, buffer_offset_, &mc_addr) == ncclSuccess &&
+  if (ncclGetLsaMultimemDevicePointer(combined_win_, 0, &mc_addr) ==
+          ncclSuccess &&
       mc_addr != nullptr) {
     mc_addr_ = mc_addr;
   }
@@ -302,25 +240,16 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
     if (buffers_dev_ != nullptr) {
       c10::cuda::CUDACachingAllocator::raw_delete(buffers_dev_);
     }
-    if (signal_pads_dev_ != nullptr) {
-      c10::cuda::CUDACachingAllocator::raw_delete(signal_pads_dev_);
-    }
   }
 
  private:
   size_t buffer_size_;
-  // Byte offset from the allocation base to the start of the user buffer; the
-  // signal pad occupies [0, buffer_offset_).
-  size_t buffer_offset_;
   int device_idx_;
   int rank_;
   int world_size_;
   std::vector<void*> buffers_;
-  std::vector<void*> signal_pads_;
   void** buffers_dev_{nullptr};
-  void** signal_pads_dev_{nullptr};
   std::string group_name_;
-  // Single NCCL window covering both the user data buffer and the signal pad.
   ncclWindow_t combined_win_{nullptr};
   // Multicast address (data buffer base within the multicast mapping)
   void* mc_addr_{nullptr};
@@ -482,9 +411,7 @@ size_t NCCLSymmetricMemory::get_offset() {
 }
 
 size_t NCCLSymmetricMemory::get_window_offset() {
-  // The NCCL window starts at the signal pad; this handle's data lives
-  // buffer_offset_ bytes further in, plus its own offset within the buffer.
-  return pai_->buffer_offset_ + offset_;
+  return offset_;
 }
 
 #ifdef NCCL_HAS_HOST_CFT
@@ -560,11 +487,6 @@ struct PadRequest {
 
 class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
  public:
-  // Allocates a symmetric-memory region laid out as [signal pad | data buffer]:
-  // the signal pad occupies [0, buffer_offset) and the user data buffer starts
-  // at buffer_offset. Returns the data buffer pointer (alloc_base +
-  // buffer_offset), NOT the allocation base -- the signal pad stays hidden in
-  // front, and free()/rendezvous() key off this returned data pointer.
   void* alloc(
       size_t size,
       int device_idx,
@@ -575,38 +497,17 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
         "must not be called with a group_name");
 
     c10::cuda::CUDAGuard guard(device_idx);
-    // Allocate signal pad + buffer together in a single ncclMemAlloc call.
-    // Layout: signal pad in [0, buffer_offset), data buffer after it.
-    // buffer_offset is the signal pad size rounded up to signal_pad_alignment,
-    // so the data buffer is aligned; the data size is rounded up as well. A
-    // single window is registered over the whole region at rendezvous time, so
-    // only the base pointer (already granularity-aligned by ncclMemAlloc) needs
-    // to satisfy NCCL's window-alignment requirement.
-    const size_t buffer_offset =
-        at::round_up(get_signal_pad_size(), signal_pad_alignment);
-    const size_t aligned_buffer_size = at::round_up(size, 16UL);
-    const size_t total_size = buffer_offset + aligned_buffer_size;
+    // ncclMemAlloc rejects a zero size.
+    const size_t total_size = at::round_up(std::max<size_t>(size, 1), 16UL);
     void* alloc_base;
     C10D_NCCL_CHECK(ncclMemAlloc(&alloc_base, total_size), "ncclMemAlloc");
-    // ncclMemAlloc does not zero memory. Zero the signal pad (the first
-    // buffer_offset bytes) so the CAS-based barrier() protocol starts from a
-    // known all-zero state on first use.
-    C10_CUDA_CHECK(cudaMemset(alloc_base, 0, buffer_offset));
-    // Hand back the data buffer pointer, not alloc_base; the signal pad stays
-    // hidden in front. Returning the data ptr is safe for free(): the whole
-    // block is owned by the NCCLAllocation keyed below, which ncclMemFree's
-    // alloc_base in its destructor, so free() only needs the data ptr to drop
-    // the allocation entry.
-    void* buffer_ptr = static_cast<char*>(alloc_base) + buffer_offset;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      // Key by the data pointer we return (that's what `free()` receives).
       allocations_.emplace(
-          buffer_ptr,
-          std::make_unique<NCCLAllocation>(
-              alloc_base, size, buffer_offset, device_idx));
+          alloc_base,
+          std::make_unique<NCCLAllocation>(alloc_base, size, device_idx));
     }
-    return buffer_ptr;
+    return alloc_base;
   }
 
   void free(void* ptr) override {
@@ -640,9 +541,7 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       const std::optional<std::string>& group_name) override {
     TORCH_CHECK(group_name.has_value(), "group_name must be provided");
     NCCLAllocation* allocation;
-    // The covering allocation's map key is buffer_ptr (the data buffer base
-    // alloc() returned, == alloc_base + buffer_offset); captured here so we
-    // don't recompute it below.
+    // The covering allocation's map key, the base alloc() returned.
     void* buffer_ptr_key = nullptr;
     SymmMemKey key{ptr, *group_name};
     {
@@ -679,7 +578,6 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       info->pad_ = std::move(pad);
       pai = std::move(info);
     }
-    // Offset is relative to the data buffer base (past the signal pad).
     size_t offset = reinterpret_cast<uintptr_t>(ptr) -
         reinterpret_cast<uintptr_t>(buffer_ptr_key);
     // Create the SymmetricMemory handle.
@@ -768,7 +666,7 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
           C10D_NCCL_CHECK(ncclMemAlloc(&base, alloc_size), "ncclMemAlloc");
           auto owner = c10::make_intrusive<NCCLSignalPadOwner>();
           owner->allocation = std::make_unique<NCCLAllocation>(
-              base, alloc_size, /*buffer_offset=*/0, device_idx);
+              base, alloc_size, device_idx);
           C10_CUDA_CHECK(cudaMemset(base, 0, alloc_size));
           owner->pai = c10::make_intrusive<NCCLPeerAllocInfo>(
               owner->allocation.get(), group_name);

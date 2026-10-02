@@ -198,8 +198,6 @@ void nccl_all_to_all_nd(
   auto window = nccl_hdl->get_window();
   TORCH_CHECK(window != nullptr, "nccl_all_to_all_nd: NCCL window is null");
 
-  // The window base is the signal pad, so offsets into it must skip the pad;
-  // use get_window_offset() (buffer_offset + get_offset()), not get_offset().
   const size_t window_base_offset = nccl_hdl->get_window_offset();
 
   const int64_t esize = input.element_size();

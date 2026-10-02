@@ -82,8 +82,6 @@ class CUDAPeerAllocInfo : public c10::intrusive_ptr_target {
   CUDAPeerAllocInfo(
       std::vector<c10::intrusive_ptr<AllocationRef>> alloc_refs,
       std::vector<void*> buffers,
-      std::vector<void*> signal_pads,
-      void* mc_signal_pad_addr,
       HandleType mc_handle,
       void* mc_addr,
       size_t buffer_size,
@@ -95,8 +93,6 @@ class CUDAPeerAllocInfo : public c10::intrusive_ptr_target {
  private:
   std::vector<c10::intrusive_ptr<AllocationRef>> alloc_refs_;
   std::vector<void*> buffers_;
-  std::vector<void*> signal_pads_;
-  void* mc_signal_pad_addr_;
   HandleType mc_handle_;
   void* mc_addr_;
   size_t buffer_size_;
@@ -104,7 +100,6 @@ class CUDAPeerAllocInfo : public c10::intrusive_ptr_target {
   int rank_;
   int world_size_;
   void** buffers_dev_;
-  void** signal_pads_dev_;
   std::string group_name_;
   // The group's pad, set by rendezvous() before the info is shared with any
   // handle. Unset only on the info that maps a pad itself.
@@ -121,9 +116,6 @@ struct Block : public c10::intrusive_ptr_target {
   int device_idx;
   size_t block_size;
   size_t buffer_size;
-  // Byte offset from the allocation base (alloc_ref->ptr) to the start of the
-  // user buffer; the signal pad occupies [0, buffer_offset).
-  size_t buffer_offset;
   std::optional<std::string> default_group_name;
   std::map<std::string, c10::intrusive_ptr<CUDAPeerAllocInfo>> symm_mems;
 
@@ -132,7 +124,6 @@ struct Block : public c10::intrusive_ptr_target {
       int device_idx,
       size_t block_size,
       size_t buffer_size,
-      size_t buffer_offset,
       const std::optional<std::string>& group_name);
 };
 

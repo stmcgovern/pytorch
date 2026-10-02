@@ -7,8 +7,7 @@
 namespace c10d::symmetric_memory {
 
 // Validates a peer rank used to index the per-peer arrays of buffer/signal
-// pad pointers. An out-of-range rank reads or writes through a wild pointer,
-// or lands past the signal pad in the peer's tensor data.
+// pad pointers. An out-of-range rank reads or writes through a wild pointer.
 inline void check_rank(int rank, int world_size) {
   TORCH_CHECK(
       rank >= 0 && rank < world_size,

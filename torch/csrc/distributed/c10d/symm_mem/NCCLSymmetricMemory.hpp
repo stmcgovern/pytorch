@@ -78,8 +78,8 @@ class TORCH_API NCCLSymmetricMemory : public SymmetricMemory {
 
   size_t get_offset() override;
 
-  // Byte offset of this handle's data within the NCCL window. The window
-  // starts at the signal pad, so this is buffer_offset + get_offset().
+  // Byte offset of this handle's data within the NCCL window, which starts at
+  // the allocation base.
   size_t get_window_offset();
 
  private:
