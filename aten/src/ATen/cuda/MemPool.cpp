@@ -19,7 +19,8 @@ MemPool::MemPool(
     std::shared_ptr<CUDACachingAllocator::CUDAAllocator> allocator,
     bool is_user_created,
     bool use_on_oom,
-    bool no_split)
+    bool no_split,
+    bool ordered_reuse)
     : is_user_created_(is_user_created) {
   if (is_user_created_) {
     id_ = {0, uid_++};
@@ -34,6 +35,9 @@ MemPool::MemPool(
   }
   if (no_split) {
     CUDACachingAllocator::setNoSplit(device_, id_);
+  }
+  if (ordered_reuse) {
+    CUDACachingAllocator::setOrderedReuse(device_, id_);
   }
 }
 

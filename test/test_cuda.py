@@ -9782,6 +9782,39 @@ for args in ((a, b), (a, b, False)):
     @unittest.skipIf(TEST_CUDAMALLOCASYNC, "not supported by CUDAMallocAsync")
     @unittest.skipIf(EXPANDABLE_SEGMENTS, "not supported by expandable segments")
     @serialTest()
+    def test_mempool_ordered_reuse(self):
+        # A block freed while another stream still uses it is passed over until
+        # that use finishes, unless the pool reuses in program order.
+        side = torch.cuda.Stream()
+        # Load the kernels first: loading one waits for the device to go idle.
+        torch.cuda._sleep(1)
+        torch.ones(1, device="cuda").add_(1)
+        torch.cuda.synchronize()
+
+        def reuses_block_freed_while_in_use(pool):
+            with torch.cuda.use_mem_pool(pool):
+                a = torch.empty(1024, device="cuda")
+                address = a.data_ptr()
+                with torch.cuda.stream(side):
+                    torch.cuda._sleep(100_000_000)
+                    a.add_(1)
+                a.record_stream(side)
+                del a
+                if side.query():
+                    self.skipTest("the side stream finished before the allocation")
+                b = torch.empty(1024, device="cuda")
+                reused = b.data_ptr() == address
+            torch.cuda.synchronize()
+            return reused
+
+        self.assertFalse(reuses_block_freed_while_in_use(torch.cuda.MemPool()))
+        self.assertTrue(
+            reuses_block_freed_while_in_use(torch.cuda.MemPool(ordered_reuse=True))
+        )
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "not supported by CUDAMallocAsync")
+    @unittest.skipIf(EXPANDABLE_SEGMENTS, "not supported by expandable segments")
+    @serialTest()
     def test_mempool_no_split_erased_on_release(self):
         # Destroying a no_split MemPool must drop its id from the allocator's
         # no_split_pools set. Otherwise a pool later registered under the same

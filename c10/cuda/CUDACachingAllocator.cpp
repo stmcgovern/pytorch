@@ -1554,6 +1554,9 @@ class DeviceCachingAllocator {
 
   // tracks which pools should not split a segment
   ska::flat_hash_set<MempoolId_t, MempoolIdHash> no_split_pools;
+  // Pools whose allocations wait for the pool's pending frees rather than
+  // passing over their blocks. See setOrderedReuse.
+  ska::flat_hash_set<MempoolId_t, MempoolIdHash> ordered_reuse_pools;
 
   // Map of blocks whose freeing is deferred until after CUDA graph capture.
   //   - Key: Block* to be freed.
@@ -1833,6 +1836,10 @@ class DeviceCachingAllocator {
 
     size_t size = round_size(orig_size);
     auto& pool = get_pool(size, stream);
+    if (pool.owner_PrivatePool && !is_capture_context() &&
+        ordered_reuse_pools.count(pool.owner_MempoolId())) {
+      synchronize_and_free_events(context, pool.owner_PrivatePool);
+    }
     const size_t alloc_size = get_allocation_size(size);
     bool active_user_pool =
         pool.owner_PrivatePool && pool.owner_PrivatePool->allocator();
@@ -3242,6 +3249,17 @@ class DeviceCachingAllocator {
     no_split_pools.insert(mempool_id);
   }
 
+  // A block freed while another stream still uses it (record_stream) normally
+  // becomes reusable once that use finishes, so which block an allocation gets
+  // depends on timing. In an ordered-reuse pool an allocation first waits for
+  // the pool's pending frees, so it depends only on the order of allocations
+  // and frees: processes that make the same calls get the same layout, which
+  // symmetric memory relies on.
+  void setOrderedReuse(MempoolId_t mempool_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    ordered_reuse_pools.insert(mempool_id);
+  }
+
   // See Note [Interaction with CUDA graph capture]
 
   // Routes allocations matching `filter` into the private mempool
@@ -3378,6 +3396,7 @@ class DeviceCachingAllocator {
       bool inserted = graph_pools_freeable.insert({mempool_id, pp}).second;
       TORCH_INTERNAL_ASSERT(inserted);
       no_split_pools.erase(mempool_id);
+      ordered_reuse_pools.erase(mempool_id);
     }
   }
 
@@ -5225,6 +5244,12 @@ class NativeCachingAllocator : public CUDAAllocator {
   void setNoSplit(c10::DeviceIndex device, MempoolId_t mempool_id) override {
     assertValidDevice(device);
     device_allocator[device]->setNoSplit(std::move(mempool_id));
+  }
+
+  void setOrderedReuse(c10::DeviceIndex device, MempoolId_t mempool_id)
+      override {
+    assertValidDevice(device);
+    device_allocator[device]->setOrderedReuse(std::move(mempool_id));
   }
 
   // CUDAGraph interactions

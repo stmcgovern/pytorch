@@ -1399,6 +1399,13 @@ class MemPool(_MemPool):
             to Out Of Memory. This is False by default.
         no_split(bool): a bool that indicates if this pool should not split a segment.
             This is False by default.
+        ordered_reuse(bool): a bool that indicates if an allocation from this
+            pool should wait for the pool's blocks still in use on other streams
+            (see :meth:`~torch.Tensor.record_stream`) to be released, rather
+            than pass over them. Which block an allocation gets then depends
+            only on the order of allocations and frees, not on timing, so
+            processes making the same calls get the same layout. This is False
+            by default.
     """
 
     def __init__(
@@ -1406,9 +1413,10 @@ class MemPool(_MemPool):
         allocator: _cuda_CUDAAllocator | None = None,
         use_on_oom: bool = False,
         no_split: bool = False,
+        ordered_reuse: bool = False,
     ):
         # pyrefly: ignore [bad-argument-count]
-        super().__init__(allocator, True, use_on_oom, no_split)
+        super().__init__(allocator, True, use_on_oom, no_split, ordered_reuse)
 
     @property
     def id(self) -> tuple[int, int]:
