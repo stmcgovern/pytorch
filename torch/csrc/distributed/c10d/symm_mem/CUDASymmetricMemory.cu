@@ -81,7 +81,6 @@ CUDAPeerAllocInfo::CUDAPeerAllocInfo(
     std::vector<void*> buffers,
     std::vector<void*> signal_pads,
     void* mc_signal_pad_addr,
-    size_t barrier_state_offset,
     HandleType mc_handle,
     void* mc_addr,
     size_t buffer_size,
@@ -93,7 +92,6 @@ CUDAPeerAllocInfo::CUDAPeerAllocInfo(
       buffers_(std::move(buffers)),
       signal_pads_(std::move(signal_pads)),
       mc_signal_pad_addr_(mc_signal_pad_addr),
-      barrier_state_offset_(barrier_state_offset),
       mc_handle_(mc_handle),
       mc_addr_(mc_addr),
       buffer_size_(buffer_size),
@@ -140,6 +138,7 @@ CUDASymmetricMemory::CUDASymmetricMemory(
       offset_(offset) {
   // offset is specific per symm_mem handle
   TORCH_INTERNAL_ASSERT(offset_ < pai_->buffer_size_, "offset out of range");
+  TORCH_INTERNAL_ASSERT(pai_->pad_ != nullptr, "handle without a signal pad");
 }
 
 std::vector<void*> CUDASymmetricMemory::get_buffer_ptrs() {
@@ -147,7 +146,7 @@ std::vector<void*> CUDASymmetricMemory::get_buffer_ptrs() {
 }
 
 std::vector<void*> CUDASymmetricMemory::get_signal_pad_ptrs() {
-  return pai_->signal_pads_;
+  return pai_->pad_->peers();
 }
 
 void** CUDASymmetricMemory::get_buffer_ptrs_dev() {
@@ -155,11 +154,15 @@ void** CUDASymmetricMemory::get_buffer_ptrs_dev() {
 }
 
 void** CUDASymmetricMemory::get_signal_pad_ptrs_dev() {
-  return pai_->signal_pads_dev_;
+  return pai_->pad_->peers_dev();
 }
 
 size_t CUDASymmetricMemory::get_buffer_size() {
   return pai_->buffer_size_;
+}
+
+size_t CUDASymmetricMemory::get_signal_pad_size() {
+  return pai_->pad_->size();
 }
 
 bool CUDASymmetricMemory::has_multicast_support() {
@@ -195,13 +198,13 @@ void CUDASymmetricMemory::barrier(int channel, size_t timeout_ms) {
       world_size_);
   c10::cuda::CUDAGuard device_guard(local_device_idx_);
   GroupStreamGuard stream_guard(pai_->group_name_, pg);
-  if (get_multicast_ptr() != nullptr) {
-    const auto state_offset = pai_->barrier_state_offset_;
+  if (pai_->pad_->multicast() != nullptr) {
+    const auto state_offset = signal_pad_barrier_state_offset(pai_->pad_->size());
     multimem_barrier_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<uint32_t*>(
-            static_cast<char*>(pai_->signal_pads_[rank_]) + state_offset),
+            static_cast<char*>(pai_->pad_->peers()[rank_]) + state_offset),
         reinterpret_cast<uint32_t*>(
-            static_cast<char*>(pai_->mc_signal_pad_addr_) + state_offset),
+            static_cast<char*>(pai_->pad_->multicast()) + state_offset),
         channel,
         rank_,
         world_size_,
@@ -213,7 +216,7 @@ void CUDASymmetricMemory::barrier(int channel, size_t timeout_ms) {
         max(at::cuda::warp_size(), world_size_),
         0,
         at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<uint32_t**>(pai_->signal_pads_dev_),
+        reinterpret_cast<uint32_t**>(pai_->pad_->peers_dev()),
         channel,
         rank_,
         world_size_,
@@ -249,7 +252,7 @@ void CUDASymmetricMemory::put_signal(
       at::cuda::warp_size(),
       0,
       at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<uint32_t**>(pai_->signal_pads_dev_),
+      reinterpret_cast<uint32_t**>(pai_->pad_->peers_dev()),
       dst_rank,
       channel,
       rank_,
@@ -285,7 +288,7 @@ void CUDASymmetricMemory::wait_signal(
       at::cuda::warp_size(),
       0,
       at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<uint32_t**>(pai_->signal_pads_dev_),
+      reinterpret_cast<uint32_t**>(pai_->pad_->peers_dev()),
       src_rank,
       channel,
       rank_,
@@ -331,23 +334,17 @@ using Expandable_Segments_Handle_Type =
     c10::cuda::CUDACachingAllocator::Expandable_Segments_Handle_Type;
 }
 
-// Allocates a symmetric-memory region laid out as
-// [signal pad | barrier state | data buffer]: the signal pad and the multimem
-// barrier's state each take half of [0, buffer_offset), and the user data
-// buffer starts at buffer_offset. Returns the data buffer pointer
-// (alloc_base + buffer_offset), NOT the allocation base -- the signal pad stays
-// hidden in front, and free()/rendezvous() key off this returned data pointer.
-void* CUDASymmetricMemoryAllocator::alloc(
+// Allocates and maps a symmetric-memory region laid out as [signal pad | data
+// buffer]: the signal pad occupies [0, buffer_offset) and the data buffer
+// starts at buffer_offset. The block is not registered; alloc() does that.
+c10::intrusive_ptr<Block> CUDASymmetricMemoryAllocator::create_block(
     size_t size,
     int device_idx,
     const std::optional<std::string>& group_name) {
-  // The barrier state shadows the signal pad: channel c's arrival counter is
-  // at the index of its src-0 slot, so the state is as large as the pad.
-  // Kernels outside PyTorch index the pad as world_size * channel + src, so
-  // PyTorch's own state stays out of it. The halves are rounded so the data
-  // buffer stays aligned to signal_pad_alignment.
+  // buffer_offset is the signal pad size rounded up to signal_pad_alignment so
+  // the data buffer stays aligned.
   size_t buffer_offset =
-      2 * at::round_up(get_signal_pad_size(), signal_pad_alignment / 2);
+      at::round_up(get_signal_pad_size(), signal_pad_alignment);
   size_t block_size = buffer_offset + at::round_up(size, 16UL);
   c10::cuda::CUDAGuard guard(device_idx);
   device_idx = static_cast<int>(guard.current_device().index());
@@ -417,31 +414,38 @@ void* CUDASymmetricMemoryAllocator::alloc(
   void* alloc_base = nullptr;
   map_block(&alloc_base, handle, block_size, device_idx);
 
-  // Zero the signal pad and the barrier state ([0, buffer_offset)): both
-  // barrier() protocols start from zero. The data buffer that follows does not
-  // need zeroing. Zero on the current stream, then sync so the region is fully
-  // zeroed before rendezvous can expose it to peers.
+  // Zero the signal pad (at the front, [0, buffer_offset)) to initialize it for
+  // the CAS-based barrier() protocol; the data buffer that follows does not
+  // need zeroing. Zero on the current stream, then sync so the signal pad is
+  // fully zeroed before rendezvous can expose it to peers.
   auto stream =
       at::cuda::getCurrentCUDAStream(static_cast<c10::DeviceIndex>(device_idx));
   AT_CUDA_CHECK(cudaMemsetAsync(alloc_base, 0, buffer_offset, stream));
   AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  // Hand back the data buffer pointer, not alloc_base; the signal pad stays
-  // hidden in front. Returning the data ptr (rather than the alloc ptr) is safe
-  // for free(): the whole block is owned by the AllocationRef held in the
-  // Block, so free() only needs the data ptr to find and drop the Block; the
-  // block (and thus alloc_base) is released internally by ~AllocationRef.
-  void* buffer_ptr = static_cast<char*>(alloc_base) + buffer_offset;
-
   auto alloc_ref = c10::make_intrusive<AllocationRef>(
       alloc_base, handle, block_size, device_idx);
-  auto block = c10::make_intrusive<Block>(
+  return c10::make_intrusive<Block>(
       std::move(alloc_ref),
       device_idx,
       block_size,
       size,
       buffer_offset,
       group_name);
+}
+
+void* CUDASymmetricMemoryAllocator::alloc(
+    size_t size,
+    int device_idx,
+    const std::optional<std::string>& group_name) {
+  auto block = create_block(size, device_idx, group_name);
+  // Hand back the data buffer pointer, not alloc_base; the signal pad stays
+  // hidden in front. Returning the data ptr (rather than the alloc ptr) is safe
+  // for free(): the whole block is owned by the AllocationRef held in the
+  // Block, so free() only needs the data ptr to find and drop the Block; the
+  // block (and thus alloc_base) is released internally by ~AllocationRef.
+  void* buffer_ptr =
+      static_cast<char*>(block->alloc_ref->ptr) + block->buffer_offset;
   {
     std::unique_lock lock(mutex_);
     // Key by the data pointer we return (that's what free()/rendezvous see).
@@ -1061,8 +1065,6 @@ c10::intrusive_ptr<CUDAPeerAllocInfo> make_peer_alloc_info(
       std::move(buffers),
       std::move(signal_pads),
       mc_signal_pad_addr,
-      // alloc() splits [0, buffer_offset) into the pad and the barrier state.
-      block->buffer_offset / 2,
       mc_handle,
       mc_buffer_addr,
       block->buffer_size,
@@ -1110,6 +1112,9 @@ c10::intrusive_ptr<SymmetricMemory> CUDASymmetricMemoryAllocator::rendezvous(
   // If found, this block has been rendezvous by the given group
   auto it = block->symm_mems.find(group_name_);
   if (it == block->symm_mems.end()) {
+    // The pad first: creating it on the group's first rendezvous is itself a
+    // rendezvous, which must not overlap this one's IpcChannel.
+    auto pad = signal_pad(group_name_, block->device_idx);
     // Create PeerAllocInfo for this block (this is the costly part)
     TORCH_INTERNAL_ASSERT(
         handle_type_ != Expandable_Segments_Handle_Type::UNSPECIFIED)
@@ -1118,6 +1123,7 @@ c10::intrusive_ptr<SymmetricMemory> CUDASymmetricMemoryAllocator::rendezvous(
     // PeerAllocInfo captures this block's rendezvous info
     auto pai = use_fabric ? make_peer_alloc_info<true>(block, group_name_)
                           : make_peer_alloc_info<false>(block, group_name_);
+    pai->pad_ = std::move(pad);
     // Cache it with the group name
     it = block->symm_mems.emplace(group_name_, pai).first;
   }
@@ -1125,6 +1131,36 @@ c10::intrusive_ptr<SymmetricMemory> CUDASymmetricMemoryAllocator::rendezvous(
   // Create symm mem handle for this tensor, specified by its offset
   auto pai = it->second;
   return c10::make_intrusive<CUDASymmetricMemory>(pai, offset);
+}
+
+std::shared_ptr<const SignalPad> CUDASymmetricMemoryAllocator::signal_pad(
+    const std::string& group_name,
+    int device_idx) {
+  auto group = resolve_process_group(group_name);
+  return get_or_create_signal_pad(
+      group, static_cast<c10::DeviceIndex>(device_idx), [&] {
+        // A pad is the data of a block of its own, kept out of ptr_to_block_
+        // so it is never taken for a user allocation. Its rendezvous checks
+        // that every rank asked for the same size.
+        const size_t size = get_signal_pad_size();
+        const size_t alloc_size = signal_pad_alloc_size(size);
+        auto block = create_block(alloc_size, device_idx, std::nullopt);
+        {
+          c10::cuda::CUDAGuard guard(device_idx);
+          auto stream = at::cuda::getCurrentCUDAStream(
+              static_cast<c10::DeviceIndex>(device_idx));
+          void* base =
+              static_cast<char*>(block->alloc_ref->ptr) + block->buffer_offset;
+          AT_CUDA_CHECK(cudaMemsetAsync(base, 0, alloc_size, stream));
+          AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        bool use_fabric =
+            handle_type_ == Expandable_Segments_Handle_Type::FABRIC_HANDLE;
+        auto pai = use_fabric ? make_peer_alloc_info<true>(block, group_name)
+                              : make_peer_alloc_info<false>(block, group_name);
+        return std::make_shared<const SignalPad>(
+            pai, pai->buffers_, pai->buffers_dev_, pai->mc_addr_, size);
+      });
 }
 
 bool CUDASymmetricMemoryAllocator::has_multicast_support(int device_idx) {

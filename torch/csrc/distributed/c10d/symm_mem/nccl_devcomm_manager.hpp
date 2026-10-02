@@ -81,6 +81,11 @@ class TORCH_API NCCLDevCommManager {
   }
 #endif // NCCL_HAS_SYMMEM_DEVICE_SUPPORT
 
+  bool has_comm(const std::string& group_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return group_to_comm_.count(group_name) != 0;
+  }
+
   // Get a host-side NCCL communicator for a group.
   // This is the regular host-side communicator, not the device communicator.
   // @param group_name The process group name

@@ -325,7 +325,11 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
   // Multicast address (data buffer base within the multicast mapping)
   void* mc_addr_{nullptr};
   ncclComm_t comm_{nullptr};
+  // The group's pad, set by rendezvous() before the info is shared with any
+  // handle. Unset only on the info that maps a pad itself.
+  std::shared_ptr<const SignalPad> pad_;
   friend class NCCLSymmetricMemory;
+  friend class NCCLSymmetricMemoryAllocator;
 };
 
 NCCLSymmetricMemory::NCCLSymmetricMemory(
@@ -337,6 +341,7 @@ NCCLSymmetricMemory::NCCLSymmetricMemory(
       world_size_(pai_->world_size_),
       device_idx_(pai_->device_idx_) {
   TORCH_INTERNAL_ASSERT(offset_ < pai_->buffer_size_, "offset out of range");
+  TORCH_INTERNAL_ASSERT(pai_->pad_ != nullptr, "handle without a signal pad");
 }
 
 std::vector<void*> NCCLSymmetricMemory::get_buffer_ptrs() {
@@ -344,7 +349,7 @@ std::vector<void*> NCCLSymmetricMemory::get_buffer_ptrs() {
 }
 
 std::vector<void*> NCCLSymmetricMemory::get_signal_pad_ptrs() {
-  return pai_->signal_pads_;
+  return pai_->pad_->peers();
 }
 
 void** NCCLSymmetricMemory::get_buffer_ptrs_dev() {
@@ -352,11 +357,15 @@ void** NCCLSymmetricMemory::get_buffer_ptrs_dev() {
 }
 
 void** NCCLSymmetricMemory::get_signal_pad_ptrs_dev() {
-  return pai_->signal_pads_dev_;
+  return pai_->pad_->peers_dev();
 }
 
 size_t NCCLSymmetricMemory::get_buffer_size() {
   return pai_->buffer_size_;
+}
+
+size_t NCCLSymmetricMemory::get_signal_pad_size() {
+  return pai_->pad_->size();
 }
 
 bool NCCLSymmetricMemory::has_multicast_support() {
@@ -373,7 +382,7 @@ void* NCCLSymmetricMemory::get_multicast_ptr() {
 void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
 #ifdef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
   TORCH_CHECK(
-      pai_->signal_pads_dev_ != nullptr,
+      pai_->pad_->peers_dev() != nullptr,
       "NCCLSymmetricMemory::barrier requires peer signal pad pointers, which "
       "are only populated when peers are accessible over the symmetric-memory "
       "(LSA/NVLink) domain.");
@@ -385,7 +394,7 @@ void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
       std::max(at::cuda::warp_size(), world_size_),
       0,
       at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<uint32_t**>(pai_->signal_pads_dev_),
+      reinterpret_cast<uint32_t**>(pai_->pad_->peers_dev()),
       channel,
       rank_,
       world_size_,
@@ -532,6 +541,23 @@ std::string NCCLSymmetricMemory::get_group_name() {
   return pai_->group_name_;
 }
 
+namespace {
+
+// Owns a group signal pad: its memory and the window over it. Members are
+// destroyed in reverse order, so the window goes before the memory.
+struct NCCLSignalPadOwner : public c10::intrusive_ptr_target {
+  std::unique_ptr<NCCLAllocation> allocation;
+  c10::intrusive_ptr<NCCLPeerAllocInfo> pai;
+};
+
+// What a rank tells its peers before a pad is allocated.
+struct PadRequest {
+  size_t size;
+  uint8_t has_comm;
+};
+
+} // namespace
+
 class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
  public:
   // Allocates a symmetric-memory region laid out as [signal pad | data buffer]:
@@ -638,6 +664,10 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       buffer_ptr_key = alloc_it->first;
     }
 
+    // The pad first: creating it on the group's first rendezvous registers a
+    // window of its own, which must not overlap this one's.
+    auto pad = signal_pad(*group_name, allocation->device_idx);
+
     // Get or create peer alloc info for the group under the per-allocation
     // lock. This serializes concurrent rendezvous on the same allocation
     // for different groups (e.g., forward vs backward).
@@ -645,7 +675,9 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     auto& peer_alloc_infos = allocation->peer_alloc_infos_;
     auto& pai = peer_alloc_infos[*group_name];
     if (!pai) {
-      pai = c10::make_intrusive<NCCLPeerAllocInfo>(allocation, *group_name);
+      auto info = c10::make_intrusive<NCCLPeerAllocInfo>(allocation, *group_name);
+      info->pad_ = std::move(pad);
+      pai = std::move(info);
     }
     // Offset is relative to the data buffer base (past the signal pad).
     size_t offset = reinterpret_cast<uintptr_t>(ptr) -
@@ -690,6 +722,62 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
   }
 
  private:
+  // The signal pad of (group, device), created by the group's first
+  // rendezvous on the device. It is an allocation of its own, kept out of
+  // allocations_ so it is never taken for a user tensor.
+  std::shared_ptr<const SignalPad> signal_pad(
+      const std::string& group_name,
+      int device_idx) {
+    auto group = resolve_process_group(group_name);
+    return get_or_create_signal_pad(
+        group, static_cast<c10::DeviceIndex>(device_idx), [&] {
+          const size_t size = get_signal_pad_size();
+          // Agree before allocating. Registering the window is collective, so
+          // a rank that cannot take part would leave its peers waiting in it;
+          // every rank sees the same answers and fails together instead.
+          const PadRequest mine{
+              size,
+              NCCLDevCommManager::get(
+                  c10::Device(c10::DeviceType::CUDA, device_idx))
+                  .has_comm(group_name)};
+          auto reqs = storeExchange.all_gather(
+              group->getStore(), group->getRank(), group->getSize(), mine);
+          for (size_t r = 0; r < reqs.size(); ++r) {
+            TORCH_CHECK(
+                reqs[r].has_comm,
+                "NCCL symmetric memory: rank ",
+                r,
+                " has no NCCL communicator for group '",
+                group_name,
+                "'. Initialize the process group's NCCL backend eagerly by "
+                "passing `device_id` to `init_process_group`.");
+            TORCH_CHECK(
+                reqs[r].size == size,
+                "NCCL symmetric memory: ranks of group '",
+                group_name,
+                "' disagree on the signal pad size (",
+                reqs[r].size,
+                " vs ",
+                size,
+                " bytes). Call set_signal_pad_size() with the same value on "
+                "every rank.");
+          }
+          c10::cuda::CUDAGuard guard(device_idx);
+          const size_t alloc_size = signal_pad_alloc_size(size);
+          void* base = nullptr;
+          C10D_NCCL_CHECK(ncclMemAlloc(&base, alloc_size), "ncclMemAlloc");
+          auto owner = c10::make_intrusive<NCCLSignalPadOwner>();
+          owner->allocation = std::make_unique<NCCLAllocation>(
+              base, alloc_size, /*buffer_offset=*/0, device_idx);
+          C10_CUDA_CHECK(cudaMemset(base, 0, alloc_size));
+          owner->pai = c10::make_intrusive<NCCLPeerAllocInfo>(
+              owner->allocation.get(), group_name);
+          const auto& pai = *owner->pai;
+          return std::make_shared<const SignalPad>(
+              owner, pai.buffers_, pai.buffers_dev_, pai.mc_addr_, size);
+        });
+  }
+
   std::mutex mutex_;
   NCCLAllocMap allocations_;
   NCCLSymmMemMap symm_mems_;

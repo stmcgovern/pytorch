@@ -1878,17 +1878,6 @@ def _check_lc_ag_out(
         raise RuntimeError(f"{op_name}: out must be contiguous.")
 
 
-def _check_lc_signal_pad_capacity(symm_mem: _SymmetricMemory) -> None:
-    required_bytes = (_CE_MULTICAST_BARRIER_CHANNEL + 1) * symm_mem.world_size * 4
-    actual_bytes = _SymmetricMemory.signal_pad_size
-    if actual_bytes < required_bytes:
-        raise RuntimeError(
-            f"low_contention all-gather requires signal_pad_size >= "
-            f"{required_bytes} bytes for world_size={symm_mem.world_size}, but "
-            f"the current size is {actual_bytes} bytes."
-        )
-
-
 @torch.library.impl(lib, "_low_contention_all_gather_ce_multicast", "Meta")
 def _low_contention_all_gather_ce_multicast_meta(
     tensor: torch.Tensor,
@@ -1971,8 +1960,6 @@ def _low_contention_all_gather_ce_multicast_impl(
         raise RuntimeError(
             "ce_multicast output must be allocated from symmetric memory"
         )
-    _check_lc_signal_pad_capacity(symm_mem)
-
     rank = symm_mem.rank
     shard_bytes = tensor.numel() * tensor.element_size()
 
@@ -2335,15 +2322,18 @@ def get_mempool_allocator(device: _device):  # type: ignore[no-untyped-def]
 
 def set_signal_pad_size(size: int) -> None:
     r"""
-    Set the signal pad size for future symmetric memory allocations.
+    Set the signal pad size for signal pads created from now on.
 
     Signal pads are P2P-accessible memory regions used for synchronization in
     symmetric memory. This function allows users to configure
     the signal pad size to be proportional to their workload requirements.
 
     .. warning::
-        This must be called before any symmetric memory allocations are made.
-        The size cannot be changed after allocations have been performed.
+        On the CUDA and NCCL backends a signal pad belongs to a process group
+        on a device and is created by the group's first rendezvous there; it
+        keeps the size it was created with. Call this before that rendezvous,
+        with the same value on every rank. On the NVSHMEM backend it applies to
+        allocations made from now on.
 
     Args:
         size (int): the signal pad size in bytes. The size should be
@@ -2360,10 +2350,11 @@ def set_signal_pad_size(size: int) -> None:
 
 def get_signal_pad_size() -> int:
     r"""
-    Get the current signal pad size for symmetric memory allocations.
+    Get the signal pad size that signal pads created from now on will have.
 
     Returns the user-configured size if set via :func:`set_signal_pad_size`,
-    otherwise returns the default size.
+    otherwise returns the default size. A pad that already exists keeps the
+    size it was created with.
 
     Returns:
         int: the signal pad size in bytes.

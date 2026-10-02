@@ -741,6 +741,142 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
     @requires_nccl_version(
         (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
     )
+    @skip_if_lt_x_gpu(3)
+    def test_nccl_symmem_signal_pad_not_shared_across_groups(self):
+        """The NCCL-backend counterpart of
+        SymmetricMemoryTest.test_signal_pad_not_shared_across_groups in
+        test_symmetric_memory.py (#192581)."""
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        subgroup = c10d.new_group([0, 2])
+        in_subgroup = self.rank in (0, 2)
+        if in_subgroup:
+            c10d.all_reduce(torch.ones(1, device=self.device), group=subgroup)
+
+        t = symm_mem.empty(64, dtype=torch.float, device=self.device)
+        hdl_world = symm_mem.rendezvous(t, group=c10d.group.WORLD.group_name)
+        hdl_sub = (
+            symm_mem.rendezvous(t, group=subgroup.group_name) if in_subgroup else None
+        )
+        c10d.barrier()
+
+        # Subgroup rank 1 (global rank 2) writes its slot of channel 0 in rank
+        # 0's pad, the word WORLD keeps for global rank 1.
+        if self.rank == 2:
+            hdl_sub.get_signal_pad(0, (8,))[hdl_sub.rank] = 1
+            torch.cuda.synchronize()
+        c10d.barrier()
+
+        if self.rank == 0:
+            sub_pad = hdl_sub.get_signal_pad(0, (8,))
+            self.assertEqual(sub_pad[1].item(), 1)
+            self.assertEqual(hdl_world.get_signal_pad(0, (8,))[1].item(), 0)
+            # The pad is the group's and outlives this test.
+            sub_pad.zero_()
+            torch.cuda.synchronize()
+        c10d.barrier()
+
+        hdl_world.barrier()
+        if in_subgroup:
+            hdl_sub.barrier()
+        torch.cuda.synchronize()
+
+    @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_signal_pad_shared_within_group(self):
+        """Every handle of a group uses the group's pad, whatever allocation it
+        came from."""
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        t1 = symm_mem.empty(64, dtype=torch.float, device=self.device)
+        t2 = symm_mem.empty(64, dtype=torch.float, device=self.device)
+        hdl1 = symm_mem.rendezvous(t1, group=group_name)
+        hdl2 = symm_mem.rendezvous(t2, group=group_name)
+        self.assertEqual(hdl1.signal_pad_ptrs, hdl2.signal_pad_ptrs)
+        hdl1.barrier()
+        hdl2.barrier()
+        torch.cuda.synchronize()
+
+    @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_rendezvous_inside_rendezvoused_allocation(self):
+        """A storage inside an allocation the group has already rendezvoused
+        gets a handle at its offset, on the group's pad."""
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        numel = 1024
+        a = symm_mem.empty(numel, dtype=torch.float, device=self.device)
+        hdl_a = symm_mem.rendezvous(a, group=group_name)
+        # A second storage in the second half of a's allocation: rendezvous
+        # keys on the storage pointer, so a view of a would hit the cache.
+        half = numel // 2 * a.element_size()
+        storage = torch._C._construct_storage_from_data_pointer(
+            a.data_ptr() + half, a.device, half
+        )
+        b = torch.empty(0, dtype=a.dtype, device=a.device).set_(storage)
+        hdl_b = symm_mem.rendezvous(b, group=group_name)
+        self.assertEqual(hdl_b.offset, hdl_a.offset + half)
+        self.assertEqual(hdl_b.signal_pad_ptrs, hdl_a.signal_pad_ptrs)
+
+    @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_put_with_signal_leaves_channels_clear(self):
+        """nccl_put_with_signal leaves its value in place, so it has a word of
+        its own after the channel area; the group's barriers on channel 0 must
+        still complete afterwards."""
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        t = symm_mem.empty(64, dtype=torch.float, device=self.device)
+        hdl = symm_mem.rendezvous(t, group=group_name)
+        c10d.barrier()
+        # The word is the group's and keeps its value, which the put sets
+        # rather than raises. 1 leaves it below what other tests wait for.
+        if self.rank == 1:
+            torch.ops.symm_mem.nccl_put_with_signal(t, 1, 0)
+        elif self.rank == 0:
+            torch.ops.symm_mem.nccl_wait_for_signal(t, 1)
+        torch.cuda.synchronize()
+        c10d.barrier()
+
+        # Every rank checks every rank's pad, so a leftover fails the test on
+        # all of them instead of one rank failing while its peer waits in the
+        # barrier below.
+        pad = hdl.get_signal_pad(self.rank)
+        leftovers = [None] * self.world_size
+        c10d.all_gather_object(
+            leftovers, pad.view(torch.int32).nonzero().flatten().tolist()
+        )
+        self.assertEqual(leftovers, [[]] * self.world_size, "nonzero pad words by rank")
+        hdl.barrier(channel=0)
+        torch.cuda.synchronize()
+
+    @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
+    )
     @skip_if_lt_x_gpu(2)
     def test_nccl_symmem_put(self):
         symm_mem.set_backend("NCCL")
