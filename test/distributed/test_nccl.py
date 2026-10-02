@@ -878,6 +878,48 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
         (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
     )
     @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_put_get_storage_inside_allocation(self):
+        """nccl_put and nccl_get on a storage that starts inside its
+        allocation must address that storage on the peer, not the start of
+        the allocation."""
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        numel = 1024
+        whole = symm_mem.empty(2 * numel, dtype=torch.float, device=self.device)
+        whole.fill_(-1)
+        symm_mem.rendezvous(whole, group=group_name)
+        half = numel * whole.element_size()
+        storage = torch._C._construct_storage_from_data_pointer(
+            whole.data_ptr() + half, whole.device, half
+        )
+        t = torch.empty(0, dtype=whole.dtype, device=self.device).set_(storage)
+        t.fill_(self.rank)
+        symm_mem.rendezvous(t, group=group_name)
+        torch.cuda.synchronize()
+        c10d.barrier()
+
+        if self.rank == 1:
+            torch.ops.symm_mem.nccl_put(t, 0)
+        torch.cuda.synchronize()
+        c10d.barrier()
+        if self.rank == 0:
+            self.assertEqual(t, torch.ones_like(t))
+            self.assertEqual(whole[:numel], torch.full_like(t, -1))
+            t.zero_()
+            torch.ops.symm_mem.nccl_get(t, 1)
+            torch.cuda.synchronize()
+            self.assertEqual(t, torch.ones_like(t))
+        c10d.barrier()
+
+    @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
+    )
+    @skip_if_lt_x_gpu(2)
     def test_nccl_symmem_put(self):
         symm_mem.set_backend("NCCL")
         torch.cuda.set_device(self.rank)

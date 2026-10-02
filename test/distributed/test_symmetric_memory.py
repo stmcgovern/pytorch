@@ -542,6 +542,40 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skipIf(
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
     )
+    @skip_if_lt_x_gpu(2)
+    @parametrize("op", ["one_shot_all_reduce", "two_shot_all_reduce", "reduce_scatter"])
+    def test_collective_on_storage_inside_allocation(self, op: str) -> None:
+        """A storage can start inside its allocation, as one does once a pool
+        packs several tensors into it. The collectives must address that
+        storage on every peer, not the start of the allocation."""
+        self._init_process()
+        if op == "reduce_scatter" and self.world_size not in (2, 4, 8):
+            self.skipTest("reduce_scatter_out supports world sizes 2, 4 and 8")
+        group_name = dist.group.WORLD.group_name
+        numel = 1024 * self.world_size
+        whole = symm_mem.empty(2 * numel, device=self.device).fill_(-1)
+        symm_mem.rendezvous(whole, group=group_name)
+        half = numel * whole.element_size()
+        storage = torch._C._construct_storage_from_data_pointer(
+            whole.data_ptr() + half, whole.device, half
+        )
+        t = torch.empty(0, dtype=whole.dtype, device=self.device).set_(storage)
+        t.fill_(self.rank + 1)
+        self.assertEqual(symm_mem.rendezvous(t, group=group_name).offset, half)
+
+        expected = self.world_size * (self.world_size + 1) // 2
+        if op == "one_shot_all_reduce":
+            out = torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
+        elif op == "two_shot_all_reduce":
+            out = torch.ops.symm_mem.two_shot_all_reduce_(t, "sum", group_name)
+        else:
+            out = torch.empty(numel // self.world_size, device=self.device)
+            torch.ops.symm_mem.reduce_scatter_out(t, group_name, False, out)
+        self.assertEqual(out, torch.full_like(out, expected))
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
     @requires_cuda
     def test_allow_overlapping_devices(self) -> None:
         os.environ["TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES"] = "1"

@@ -71,6 +71,23 @@ namespace {
 
 using namespace c10d::symmetric_memory;
 
+// Element offset of `t` from its allocation's base, which the peer buffer
+// pointers address: its storage's offset within the allocation, nonzero for a
+// storage that starts inside one, plus the view's.
+int64_t peer_element_offset(
+    const c10::intrusive_ptr<SymmetricMemory>& symm_mem,
+    const at::Tensor& t) {
+  const auto offset = static_cast<int64_t>(symm_mem->get_offset());
+  TORCH_CHECK(
+      offset % t.element_size() == 0,
+      "symm_mem: the storage of a ",
+      t.scalar_type(),
+      " tensor starts at byte ",
+      offset,
+      " of its allocation, which is not a multiple of its element size.");
+  return offset / t.element_size() + t.storage_offset();
+}
+
 size_t get_and_verify_alignment(const at::Tensor& input, const char* op_name) {
   const size_t min_alignment = std::max(4l, input.element_size());
   // Only check the offset since the multicast address is always at least
@@ -663,7 +680,7 @@ at::Tensor one_shot_all_reduce_out_impl(
                     out.data_ptr<scalar_t>(),
                     local_input.has_value() ? local_input->data_ptr<scalar_t>()
                                             : nullptr,
-                    input.storage_offset(),
+                    peer_element_offset(symm_mem, input),
                     input.numel(),
                     reinterpret_cast<uint32_t**>(
                         symm_mem->get_signal_pad_ptrs_dev()),
@@ -935,7 +952,7 @@ at::Tensor two_shot_all_reduce_impl(
                      at::cuda::getCurrentCUDAStream()>>>(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
-                      input.storage_offset(),
+                      peer_element_offset(symm_mem, input),
                       input.numel(),
                       reinterpret_cast<uint32_t**>(
                           symm_mem->get_signal_pad_ptrs_dev()),
@@ -959,7 +976,7 @@ at::Tensor two_shot_all_reduce_impl(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
                       output->data_ptr<scalar_t>(),
-                      input.storage_offset(),
+                      peer_element_offset(symm_mem, input),
                       input.numel(),
                       reinterpret_cast<uint32_t**>(
                           symm_mem->get_signal_pad_ptrs_dev()),
@@ -1100,7 +1117,7 @@ at::Tensor reduce_scatter_out(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
                       output.data_ptr<scalar_t>(),
-                      input.storage_offset(),
+                      peer_element_offset(symm_mem, input),
                       input.numel(),
                       reinterpret_cast<uint32_t**>(
                           symm_mem->get_signal_pad_ptrs_dev()),
@@ -1129,7 +1146,7 @@ at::Tensor reduce_scatter_out(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
                       output.data_ptr<scalar_t>(),
-                      input.storage_offset(),
+                      peer_element_offset(symm_mem, input),
                       input.numel(),
                       reinterpret_cast<uint32_t**>(
                           symm_mem->get_signal_pad_ptrs_dev()),

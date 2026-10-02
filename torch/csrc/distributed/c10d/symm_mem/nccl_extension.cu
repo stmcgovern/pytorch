@@ -180,7 +180,7 @@ void nccl_put(at::Tensor& tensor, const int64_t peer) {
   lsa_put_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
     symm_mem->get_buffer_ptrs_dev(),
     peer,
-    0,
+    symm_mem->get_offset() + tensor.storage_offset() * tensor.element_size(),
     tensor.data_ptr(),
     nbytes);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -240,7 +240,7 @@ void nccl_put_with_signal(at::Tensor& tensor, int64_t signal, int64_t peer) {
     symm_mem->get_signal_pad_ptrs_dev(),
     signal_pad_u64_word_offset(symm_mem->get_signal_pad_size()),
     peer,
-    0,
+    symm_mem->get_offset() + tensor.storage_offset() * tensor.element_size(),
     tensor.data_ptr(),
     nbytes,
     blocks_done_dev,
@@ -284,7 +284,7 @@ void nccl_get(at::Tensor& tensor, const int64_t peer) {
   lsa_get_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
     symm_mem->get_buffer_ptrs_dev(),
     peer,
-    0,
+    symm_mem->get_offset() + tensor.storage_offset() * tensor.element_size(),
     tensor.data_ptr(),
     nbytes);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
