@@ -2403,20 +2403,26 @@ def get_mem_pool(device: _device) -> torch.cuda.MemPool | torch.xpu.MemPool:
     # - use_on_oom=False: we don't want to lend the space of the pool for
     # non-symmetric allocations because this could desync the allocation state
     # across ranks.
-    # - no_split=True: we don't want to split segments, because today a segment
-    # is associated with a signal pad, if two allocated tensors share a segment
-    # and their kernels concurrently use (the same) signal pad, this could cause
-    # undefined behaviors. We could consider relaxing this in the future if we
-    # establish stream tracking and implicit synchronization around an
-    # allocation.
+    # - On the CUDA and NCCL backends a signal pad belongs to a process group,
+    # not to an allocation, so a segment may hold several tensors. A tensor's
+    # offset in its segment must then be the same on every rank:
+    # ordered_reuse=True makes the pool's layout depend only on the order of
+    # allocations and frees, not on when other streams release their blocks.
+    # - Other backends keep a signal pad per allocation, so two tensors sharing
+    # a segment would share a pad: no_split=True.
     if device not in _symm_mem_pools:
         allocator = get_mempool_allocator(device)
-        # Create a new pool with the given allocator and the preset options.
-        _symm_mem_pools[device] = torch.get_device_module(device).MemPool(
-            allocator,
-            use_on_oom=False,
-            no_split=True,
-        )
+        device_module = torch.get_device_module(device)
+        if torch.device(device).type == "cuda" and get_backend(device) in (
+            "CUDA",
+            "NCCL",
+        ):
+            pool = device_module.MemPool(
+                allocator, use_on_oom=False, ordered_reuse=True
+            )
+        else:
+            pool = device_module.MemPool(allocator, use_on_oom=False, no_split=True)
+        _symm_mem_pools[device] = pool
 
     return _symm_mem_pools[device]
 

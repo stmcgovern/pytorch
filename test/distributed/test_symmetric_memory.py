@@ -3817,7 +3817,7 @@ class SymmMemPoolTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_mempool_storage_reuse(self):
-        """MemPool with no_split=True returns the same VA for same-size allocs."""
+        """The symmetric memory MemPool returns the same VA for same-size allocs."""
         self._init_process()
 
         mempool = symm_mem.get_mem_pool(self.device)
@@ -3838,6 +3838,70 @@ class SymmMemPoolTest(MultiProcContinuousTest):
             ptr2,
             "MemPool should return the same storage block for same-size re-allocation",
         )
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_mempool_tensors_share_segment(self):
+        """The pool packs small tensors into one segment; collectives on each
+        address its own storage."""
+        self._init_process()
+        if symm_mem.get_backend(self.device) != "CUDA":
+            self.skipTest("test applies to the CUDA symm mem backend")
+        group_name = dist.group.WORLD.group_name
+        mempool = symm_mem.get_mem_pool(self.device)
+        with torch.cuda.use_mem_pool(mempool):
+            a = torch.full((1024,), self.rank + 1.0, device=self.device)
+            b = torch.full((1024,), 2 * (self.rank + 1.0), device=self.device)
+        hdl_a = symm_mem.rendezvous(a, group=group_name)
+        hdl_b = symm_mem.rendezvous(b, group=group_name)
+        self.assertEqual(hdl_b.buffer_ptrs, hdl_a.buffer_ptrs)
+        self.assertNotEqual(hdl_b.offset, hdl_a.offset)
+
+        expected = self.world_size * (self.world_size + 1) / 2
+        out_a = torch.ops.symm_mem.one_shot_all_reduce(a, "sum", group_name)
+        out_b = torch.ops.symm_mem.one_shot_all_reduce(b, "sum", group_name)
+        self.assertEqual(out_a, torch.full_like(a, expected))
+        self.assertEqual(out_b, torch.full_like(b, 2 * expected))
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_mempool_layout_agrees_after_cross_stream_free(self):
+        """A tensor freed while one rank's side stream still uses it must not
+        give that rank a different layout from its peers. Otherwise a later
+        tensor sits at different offsets across ranks, and its rendezvous hits
+        the cache on some ranks while the others wait in the collective."""
+        self._init_process()
+        group_name = dist.group.WORLD.group_name
+        mempool = symm_mem.get_mem_pool(self.device)
+        side = torch.cuda.Stream()
+        # Load the kernels first: loading one waits for the device to go idle.
+        torch.cuda._sleep(1)
+        torch.ones(1, device=self.device).add_(1)
+        torch.cuda.synchronize()
+
+        with torch.cuda.use_mem_pool(mempool):
+            x = torch.empty(1024, device=self.device)
+            a = torch.empty(1024, device=self.device)
+        symm_mem.rendezvous(a, group=group_name)
+        with torch.cuda.stream(side):
+            if self.rank == 0:
+                torch.cuda._sleep(100_000_000)
+            a.add_(1)
+        a.record_stream(side)
+        del a
+        with torch.cuda.use_mem_pool(mempool):
+            c = torch.empty(1024, device=self.device)
+        offset = c.data_ptr() - x.data_ptr()
+        symm_mem.rendezvous(c, group=group_name)
+
+        offsets = [None] * self.world_size
+        dist.all_gather_object(offsets, offset)
+        self.assertEqual(len(set(offsets)), 1, f"offsets of c across ranks: {offsets}")
+        torch.cuda.synchronize()
 
     @skipIf(
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
