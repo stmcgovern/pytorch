@@ -318,12 +318,13 @@ void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
   check_channel(channel, world_size_, get_signal_pad_size());
   c10::cuda::CUDAGuard device_guard(device_idx_);
   GroupStreamGuard stream_guard(pai_->group_name_);
-  barrier_kernel<<<
+  epoch_barrier_kernel<<<
       1,
       std::max(at::cuda::warp_size(), world_size_),
       0,
       at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<uint32_t**>(pai_->pad_->peers_dev()),
+      get_signal_pad_size(),
       channel,
       rank_,
       world_size_,

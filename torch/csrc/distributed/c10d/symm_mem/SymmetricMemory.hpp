@@ -49,6 +49,12 @@ inline void check_rank(int rank, int world_size) {
 // collectives, the group's operations on one channel must be issued in the same
 // order on every rank. The NVSHMEM backend still keeps a pad per allocation.
 //
+// On the CUDA and NCCL backends barrier() keeps its state past the end of the
+// part get_signal_pad() returns: per channel, an epoch that every barrier
+// advances, in device memory so that a captured barrier advances it on every
+// replay. Nothing is reset, and nothing written to the visible pad can stall a
+// barrier.
+//
 // NOTE [symmetric memory synchronization channel]
 // Synchronization channels allow users to use a single SymmetricMemory object
 // to perform isolated synchronizations on different streams. For example,

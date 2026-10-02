@@ -429,6 +429,48 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
         (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
     )
     @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_barrier_epochs(self):
+        """Each barrier on a channel is one epoch later than the last, across
+        streams, and its state is past the pad get_signal_pad() returns: a
+        value left there does not stall it."""
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        # A buffer and stream per lane: the guard orders the barriers across
+        # streams, and stream order keeps each lane's write behind its reads.
+        lanes = []
+        for _ in range(2):
+            t = symm_mem.empty(1024, dtype=torch.float, device=self.device)
+            hdl = symm_mem.rendezvous(t, group=group_name)
+            mismatches = torch.zeros((), dtype=torch.int64, device=self.device)
+            lanes.append((hdl, t, mismatches, torch.cuda.Stream()))
+        pad = lanes[0][0].get_signal_pad(self.rank)
+        pad.fill_(42)
+        c10d.barrier()
+        for i in range(200):
+            hdl, t, mismatches, stream = lanes[i % 2]
+            with torch.cuda.stream(stream):
+                t.fill_(i)
+                hdl.barrier(channel=i % 3, timeout_ms=10_000)
+                for peer in range(self.world_size):
+                    peer_buf = hdl.get_buffer(peer, t.shape, t.dtype)
+                    mismatches.add_((peer_buf != i).sum())
+                hdl.barrier(channel=i % 3, timeout_ms=10_000)
+        torch.cuda.synchronize()
+        pad.fill_(0)
+        torch.cuda.synchronize()
+        counts = [None] * self.world_size
+        c10d.all_gather_object(counts, sum(int(lane[2]) for lane in lanes))
+        self.assertEqual(counts, [0] * self.world_size, "stale peer reads by rank")
+
+    @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 28), "NCCL Symmetric Memory support device API from nccl 2.28"
+    )
+    @skip_if_lt_x_gpu(2)
     def test_nccl_symmem_barrier_channel_out_of_bounds(self):
         symm_mem.set_backend("NCCL")
         torch.cuda.set_device(self.rank)

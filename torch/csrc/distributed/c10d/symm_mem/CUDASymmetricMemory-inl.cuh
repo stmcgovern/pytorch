@@ -17,6 +17,7 @@
 #endif
 #endif
 #include <ATen/native/cuda/MemoryAccess.cuh>
+#include <torch/csrc/distributed/c10d/symm_mem/SignalPad.hpp>
 
 namespace c10d::symmetric_memory {
 
@@ -44,6 +45,40 @@ cas(uint32_t* addr, uint32_t compare, uint32_t val) {
   CUDA_KERNEL_ASSERT(false);
   return 0;
 #endif
+}
+
+template <std::memory_order Sem>
+__device__ __forceinline__ void store_sys(uint32_t* addr, uint32_t val) {
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+  ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system> ref(*addr);
+  ref.store(val, ::cuda::std::memory_order(Sem));
+#elif defined(USE_ROCM)
+  __atomic_store_n(addr, val, static_cast<int>(Sem));
+#else
+  CUDA_KERNEL_ASSERT(false);
+#endif
+}
+
+template <std::memory_order Sem>
+__device__ __forceinline__ uint32_t load_sys(uint32_t* addr) {
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+  ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system> ref(*addr);
+  return ref.load(::cuda::std::memory_order(Sem));
+#elif defined(USE_ROCM)
+  return __atomic_load_n(addr, static_cast<int>(Sem));
+#else
+  CUDA_KERNEL_ASSERT(false);
+  return 0;
+#endif
+}
+
+// Whether a counter that only moves forward has reached `target`, modulo 2^32
+// so that it may wrap. Correct while counter and target are less than 2^31
+// apart in either direction. No rank is ever a whole barrier ahead of another,
+// so a barrier slot is within one epoch of its target and a multimem counter
+// within world_size - 1 arrivals of its target.
+__device__ __forceinline__ bool reached(uint32_t counter, uint32_t target) {
+  return static_cast<int32_t>(counter - target) >= 0;
 }
 
 __device__ __forceinline__ void trap() {
@@ -108,17 +143,35 @@ __device__ __forceinline__ void wait_signal(uint32_t* addr) {
     ;
 }
 
-// Signal pad layout: channel c holds one mailbox word per source rank, at
-// world_size * c + src. Kernels outside PyTorch index the pad this way too, so
-// it does not change; state of PyTorch's own goes outside the pad. Every
-// mailbox access goes through this function; open-coding the arithmetic is how
-// the multimem barrier's counter came to share a word with a mailbox.
+// Accessors for the signal pad layout in SignalPad.hpp. Mailboxes stay at
+// world_size * channel + src, which kernels outside PyTorch index too; state of
+// PyTorch's own goes past the part get_signal_pad() returns. Every index into a
+// pad goes through these functions.
 __device__ __forceinline__ uint32_t* signal_mailbox(
     uint32_t* pad,
     size_t world_size,
     size_t channel,
     size_t src) {
-  return pad + world_size * channel + src;
+  return pad + signal_pad_channel_words(world_size) * channel + src;
+}
+
+// barrier()'s state for `channel`: an arrival slot per source rank, then the
+// multimem arrival counter, then this rank's epoch for the channel.
+__device__ __forceinline__ uint32_t* barrier_state(
+    uint32_t* pad,
+    size_t pad_size,
+    size_t world_size,
+    size_t channel) {
+  return pad + signal_pad_barrier_state_offset(pad_size) / sizeof(uint32_t) +
+      signal_pad_barrier_state_words(world_size) * channel;
+}
+
+// The epoch of this barrier on `channel`: one more than the last. Kept in
+// device memory, so a captured barrier advances it on every replay.
+__device__ __forceinline__ uint32_t next_epoch(
+    uint32_t* state,
+    size_t world_size) {
+  return ++state[world_size + 1];
 }
 
 // Validates the channel argument for barrier(), put_signal() and
@@ -133,7 +186,7 @@ inline void check_channel(int channel, int world_size, size_t signal_pad_size) {
       channel,
       ")");
   const size_t num_channels =
-      signal_pad_size / (sizeof(uint32_t) * world_size);
+      signal_pad_num_channels(signal_pad_size, world_size);
   TORCH_CHECK(
       static_cast<size_t>(channel) < num_channels,
       "The maximum supported channel for barrier(), put_signal() and wait_signal() is ",
@@ -143,8 +196,8 @@ inline void check_channel(int channel, int world_size, size_t signal_pad_size) {
       ")");
 }
 
-// All-to-all signal barrier over the symmetric-memory signal pads, shared by
-// the CUDA and NCCL backends. Each rank sets a flag in every peer's signal pad
+// All-to-all signal barrier over the signal pads of the NVSHMEM backend, whose
+// pads have no barrier state. Each rank sets a flag in every peer's signal pad
 // (at its own slot) and waits for every peer to set the matching flag in its
 // own pad. The try_put_signal/try_wait_signal CAS protocol toggles each slot
 // 0->1 then 1->0, so the pads return to zero and the barrier is reusable.
@@ -188,23 +241,50 @@ inline void check_channel(int channel, int world_size, size_t signal_pad_size) {
   }
 }
 
+// All-to-all barrier of the CUDA and NCCL backends. Rank r stores the
+// barrier's epoch in its arrival slot on every peer, then waits until each of
+// its own slots has reached that epoch. A slot only moves forward, so a peer
+// already at the next barrier satisfies this one, and nothing is reset.
+[[maybe_unused]] static __global__ void epoch_barrier_kernel(
+    uint32_t** signal_pads,
+    size_t pad_size,
+    int channel,
+    int rank,
+    int world_size,
+    size_t timeout_ms) {
+  auto mine = barrier_state(signal_pads[rank], pad_size, world_size, channel);
+  __shared__ uint32_t epoch;
+  if (threadIdx.x == 0) {
+    epoch = next_epoch(mine, world_size);
+  }
+  __syncthreads();
+  const auto peer = threadIdx.x;
+  if (peer >= world_size || peer == rank) {
+    return;
+  }
+  store_sys<std::memory_order_release>(
+      barrier_state(signal_pads[peer], pad_size, world_size, channel) + rank,
+      epoch);
+  const size_t deadline = global_timer_ns() + timeout_ms * ns_per_ms;
+  while (!reached(load_sys<std::memory_order_acquire>(mine + peer), epoch)) {
+    if (timeout_ms != 0 && global_timer_ns() > deadline) {
+      printf(
+          "[FATAL] SymmetricMemory::barrier: rank %d at epoch %u of channel "
+          "%d still sees epoch %u from rank %d after %lu milliseconds\n",
+          rank,
+          epoch,
+          channel,
+          load_sys<std::memory_order_relaxed>(mine + peer),
+          static_cast<int>(peer),
+          timeout_ms);
+      trap();
+    }
+  }
+}
+
 #if defined(USE_ROCM) || !defined(NVCC_SUPPORTS_MULTICAST)
 __device__ __forceinline__ void multimem_red_add1_release_u32(uint32_t* addr) {
   (void)addr;
-  CUDA_KERNEL_ASSERT(false);
-}
-
-__device__ __forceinline__ uint32_t ld_acquire_sys_u32(uint32_t* addr) {
-  (void)addr;
-  CUDA_KERNEL_ASSERT(false);
-  return 0;
-}
-
-__device__ __forceinline__ void red_sub_relaxed_sys_u32(
-    uint32_t* addr,
-    uint32_t val) {
-  (void)addr;
-  (void)val;
   CUDA_KERNEL_ASSERT(false);
 }
 #else
@@ -214,60 +294,43 @@ __device__ __forceinline__ void multimem_red_add1_release_u32(uint32_t* addr) {
       : "l"(addr)
       : "memory");
 }
-
-__device__ __forceinline__ uint32_t ld_acquire_sys_u32(uint32_t* addr) {
-  ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system> ref(*addr);
-  return ref.load(::cuda::std::memory_order_acquire);
-}
-
-__device__ __forceinline__ void red_sub_relaxed_sys_u32(
-    uint32_t* addr,
-    uint32_t val) {
-  asm("red.relaxed.sys.global.add.u32 [%0], %1;"
-      :
-      : "l"(addr), "r"(0U - val)
-      : "memory");
-}
 #endif
 
-__device__ __forceinline__ bool wait_wrap_ge_u32(
-    uint32_t* addr,
-    uint32_t val,
-    size_t timeout_ms) {
-  size_t deadline = global_timer_ns() + timeout_ms * ns_per_ms;
-  while (ld_acquire_sys_u32(addr) < val) {
-    if (timeout_ms != 0 && global_timer_ns() > deadline) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// `local_counter` and `mc_counter` are this channel's arrival counter, through
-// this rank's mapping and the multicast one. It is a word of its own, outside
-// the signal pad, so a pending signal is never counted as an arrival.
-[[maybe_unused]] static __global__ void multimem_barrier_kernel(
-    uint32_t* local_counter,
-    uint32_t* mc_counter,
+// The barrier over a multicast mapping of the pads. Every rank adds 1 to the
+// arrival counter of every rank at once, so the counter only moves forward:
+// the e-th barrier on a channel is complete once it reaches e * world_size.
+[[maybe_unused]] static __global__ void multimem_epoch_barrier_kernel(
+    uint32_t* local_signal_pad,
+    uint32_t* mc_signal_pad,
+    size_t pad_size,
     int channel,
     int rank,
     int world_size,
     size_t timeout_ms) {
-  if (threadIdx.x == 0) {
-    multimem_red_add1_release_u32(mc_counter);
-    auto wait_success = wait_wrap_ge_u32(
-        local_counter, static_cast<uint32_t>(world_size), timeout_ms);
-    if (!wait_success) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  auto mine = barrier_state(local_signal_pad, pad_size, world_size, channel);
+  const uint32_t epoch = next_epoch(mine, world_size);
+  const uint32_t target = epoch * static_cast<uint32_t>(world_size);
+  multimem_red_add1_release_u32(
+      barrier_state(mc_signal_pad, pad_size, world_size, channel) + world_size);
+  const size_t deadline = global_timer_ns() + timeout_ms * ns_per_ms;
+  while (!reached(
+      load_sys<std::memory_order_acquire>(mine + world_size), target)) {
+    if (timeout_ms != 0 && global_timer_ns() > deadline) {
       printf(
-          "[FATAL] SymmetricMemory::barrier: rank %d failed to observe "
-          "multimem barrier completion on channel %d after %lu milliseconds\n",
+          "[FATAL] SymmetricMemory::barrier: rank %d at epoch %u of channel "
+          "%d counted %u of the %u multimem arrivals it needs after %lu "
+          "milliseconds\n",
           rank,
+          epoch,
           channel,
+          load_sys<std::memory_order_relaxed>(mine + world_size),
+          target,
           timeout_ms);
       trap();
     }
-    red_sub_relaxed_sys_u32(
-        local_counter, static_cast<uint32_t>(world_size));
   }
 }
 

@@ -187,25 +187,27 @@ void CUDASymmetricMemory::barrier(int channel, size_t timeout_ms) {
   c10::cuda::CUDAGuard device_guard(local_device_idx_);
   GroupStreamGuard stream_guard(pai_->group_name_, pg);
   if (pai_->pad_->multicast() != nullptr) {
-    const size_t counter = signal_pad_barrier_counters_offset(pai_->pad_->size()) +
-        channel * sizeof(uint32_t);
-    multimem_barrier_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<uint32_t*>(
-            static_cast<char*>(pai_->pad_->peers()[rank_]) + counter),
-        reinterpret_cast<uint32_t*>(
-            static_cast<char*>(pai_->pad_->multicast()) + counter),
+    multimem_epoch_barrier_kernel<<<
+        1,
+        1,
+        0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        static_cast<uint32_t*>(pai_->pad_->peers()[rank_]),
+        static_cast<uint32_t*>(pai_->pad_->multicast()),
+        get_signal_pad_size(),
         channel,
         rank_,
         world_size_,
         timeout_ms);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
-    barrier_kernel<<<
+    epoch_barrier_kernel<<<
         1,
         max(at::cuda::warp_size(), world_size_),
         0,
         at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<uint32_t**>(pai_->pad_->peers_dev()),
+        get_signal_pad_size(),
         channel,
         rank_,
         world_size_,

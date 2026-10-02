@@ -441,8 +441,7 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         self.assertTrue(signal_pad.eq(42).all())
 
         # Leave the pad zero-filled, as NOTE [symmetric memory signal pad]
-        # requires. The toggle protocol of barrier(), put_signal() and
-        # wait_signal() expects 0 or 1, so residue of 42 here wedges them.
+        # requires: put_signal() would wait forever for a mailbox holding 42.
         signal_pad.fill_(0)
         torch.cuda.synchronize()
 
@@ -538,6 +537,115 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
                 f"rank 0 arrived at {delay_s:.1f}s ({seen}). A pending "
                 f"put_signal was counted as a barrier arrival."
             )
+
+    def _barrier_round(self, hdl, t, step, mismatches, channel: int) -> None:
+        """Writes the next step into this rank's buffer and, between two
+        barriers, counts the peer buffers that do not hold it yet. Reads only
+        device tensors, so it can be captured."""
+        step.add_(1)
+        t.copy_(step.expand_as(t))
+        hdl.barrier(channel=channel)
+        for peer in range(self.world_size):
+            peer_buf = hdl.get_buffer(peer, t.shape, t.dtype)
+            mismatches.add_((peer_buf != step).sum())
+        hdl.barrier(channel=channel)
+
+    def _assert_all_ranks_zero(self, mine: int, what: str) -> None:
+        # Gathered so that a failure fails every rank rather than leaving its
+        # peers waiting in the next collective.
+        counts = [None] * self.world_size
+        dist.all_gather_object(counts, mine)
+        self.assertEqual(counts, [0] * self.world_size, f"{what} by rank")
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_barrier_epochs(self) -> None:
+        """Each barrier on a channel is one epoch later than the last, across
+        the allocations and streams of a group, and leaves the pad that
+        get_signal_pad() returns untouched."""
+        self._init_process()
+        group_name = dist.group.WORLD.group_name
+        lanes = []
+        for _ in range(2):
+            t = symm_mem.empty(1024, device=self.device)
+            lanes.append(
+                (
+                    symm_mem.rendezvous(t, group=group_name),
+                    t,
+                    torch.zeros(1, device=self.device),
+                    torch.zeros((), dtype=torch.int64, device=self.device),
+                    torch.cuda.Stream(),
+                )
+            )
+        for i in range(300):
+            hdl, t, step, mismatches, stream = lanes[i % 2]
+            with torch.cuda.stream(stream):
+                self._barrier_round(hdl, t, step, mismatches, channel=i % 3)
+        torch.cuda.synchronize()
+        self._assert_all_ranks_zero(
+            sum(int(lane[3]) for lane in lanes), "stale peer reads"
+        )
+        pad = lanes[0][0].get_signal_pad(self.rank)
+        self._assert_all_ranks_zero(
+            int(pad.view(torch.int32).count_nonzero()), "nonzero visible pad words"
+        )
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_barrier_ignores_visible_pad(self) -> None:
+        """barrier() keeps its state past the pad get_signal_pad() returns, so
+        a value left there does not stall it. The toggle protocol it replaces
+        spins forever on a mailbox it finds neither 0 nor 1."""
+        self._init_process()
+        if symm_mem.get_backend(self.device) != "CUDA":
+            self.skipTest("NVSHMEM keeps the toggle barrier")
+        t = symm_mem.empty(64, device=self.device)
+        hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
+        pad = hdl.get_signal_pad(self.rank)
+        pad.fill_(42)
+        dist.barrier()
+        for channel in range(3):
+            hdl.barrier(channel=channel, timeout_ms=10_000)
+        torch.cuda.synchronize()
+        pad.fill_(0)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    @skip_if_rocm_ver_lessthan_multiprocess((10, 1))
+    def test_barrier_epoch_advances_on_replay(self) -> None:
+        """The epoch lives in device memory, so each replay of a captured
+        barrier is a new barrier, and replays interleave with eager ones."""
+        self._init_process()
+        t = symm_mem.empty(1024, device=self.device)
+        hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
+        step = torch.zeros(1, device=self.device)
+        mismatches = torch.zeros((), dtype=torch.int64, device=self.device)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            self._barrier_round(hdl, t, step, mismatches, channel=0)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s):
+            for channel in range(2):
+                self._barrier_round(hdl, t, step, mismatches, channel)
+        for _ in range(50):
+            graph.replay()
+            self._barrier_round(hdl, t, step, mismatches, channel=1)
+        torch.cuda.synchronize()
+        self._assert_all_ranks_zero(int(mismatches), "stale peer reads")
+        self.assertEqual(int(step), 1 + 50 * 3)
 
     @skipIf(
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
@@ -1148,9 +1256,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
             ) as prof:
                 symm_mem_hdl.barrier()
                 torch.cuda.synchronize()
+            kernel = "multimem_epoch_barrier_kernel"
             self.assertTrue(
-                any("multimem_barrier_kernel" in event.key for event in prof.events()),
-                "expected multimem_barrier_kernel in profiler events",
+                any(kernel in event.key for event in prof.events()),
+                f"expected {kernel} in profiler events",
             )
 
     # --- GroupStreamGuard / stream-serialization tests ---

@@ -1,8 +1,10 @@
 #pragma once
 
+#include <c10/macros/Macros.h>
 #include <c10/util/intrusive_ptr.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -55,23 +57,46 @@ class SignalPad {
   size_t size_;
 };
 
-// A pad allocation is the channel area, `size` bytes of world_size words per
-// channel, which get_signal_pad() returns; then one u64 word for
-// nccl_put_with_signal/nccl_wait_for_signal, which leave their value in place;
-// then the multimem barrier's arrival counters, one word per channel. Neither
-// shares a word with a mailbox, and the channel area keeps the layout kernels
-// outside PyTorch index.
-constexpr size_t signal_pad_u64_word_offset(size_t size) {
+// Layout of a signal pad whose user-visible part is `size` bytes, for a group
+// of `world_size` ranks. Every index into a pad goes through these functions.
+//
+//   [0, size)        channels of world_size mailbox words, one per source rank:
+//                    put_signal/wait_signal and the collectives' block
+//                    barriers, which leave them zero. This is what
+//                    get_signal_pad() returns.
+//   u64 word         nccl_put_with_signal/nccl_wait_for_signal, which leave
+//                    their value in place.
+//   barrier state    per channel: an arrival slot per source rank, the
+//                    multimem arrival counter, and the epoch. barrier() keeps
+//                    state here that only moves forward, so a word left over
+//                    by anything else cannot wedge it.
+C10_HOST_DEVICE constexpr size_t signal_pad_channel_words(size_t world_size) {
+  return world_size;
+}
+
+C10_HOST_DEVICE constexpr size_t signal_pad_num_channels(
+    size_t size,
+    size_t world_size) {
+  return size / (sizeof(uint32_t) * signal_pad_channel_words(world_size));
+}
+
+C10_HOST_DEVICE constexpr size_t signal_pad_u64_word_offset(size_t size) {
   return (size + 7) / 8 * 8;
 }
 
-constexpr size_t signal_pad_barrier_counters_offset(size_t size) {
+C10_HOST_DEVICE constexpr size_t signal_pad_barrier_state_offset(size_t size) {
   return signal_pad_u64_word_offset(size) + sizeof(unsigned long long);
 }
 
+C10_HOST_DEVICE constexpr size_t signal_pad_barrier_state_words(
+    size_t world_size) {
+  return world_size + 2;
+}
+
 constexpr size_t signal_pad_alloc_size(size_t size, size_t world_size) {
-  return signal_pad_barrier_counters_offset(size) +
-      size / (sizeof(uint32_t) * world_size) * sizeof(uint32_t);
+  return signal_pad_barrier_state_offset(size) +
+      signal_pad_num_channels(size, world_size) *
+      signal_pad_barrier_state_words(world_size) * sizeof(uint32_t);
 }
 
 } // namespace c10d::symmetric_memory
