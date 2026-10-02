@@ -8,7 +8,9 @@
 #include <c10/util/hash.h>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <torch/csrc/distributed/c10d/symm_mem/SignalPad.hpp>
 
+#include <atomic>
 #include <map>
 #include <unordered_map>
 #include <utility>
@@ -33,6 +35,13 @@ struct GroupStreamGuard::State {
   std::map<std::optional<c10::CaptureId_t>, Frontier> frontiers;
   // Owning group, for liveness only.
   std::optional<c10::weak_intrusive_ptr<c10d::ProcessGroup>> pg;
+  // Guards `pad`. Distinct from `mu`, which a guard holds across a launch:
+  // creating the pad is a collective and launches no guarded op.
+  std::mutex pad_mu;
+  std::shared_ptr<const SignalPad> pad;
+  // Set once `pad` is, and read without pad_mu when pruning: an entry with a
+  // pad is never dropped.
+  std::atomic<bool> has_pad{false};
 };
 
 namespace {
@@ -71,7 +80,8 @@ std::shared_ptr<GroupStreamGuard::State> get_group_stream_state(
     // Drop entries whose group is gone, otherwise transient groups leak an
     // event each. Insertions are rare, so the scan is off any hot path.
     for (auto i = stream_states().begin(); i != stream_states().end();) {
-      if (!i->second->pg.has_value() || i->second->pg->expired()) {
+      if ((!i->second->pg.has_value() || i->second->pg->expired()) &&
+          !i->second->has_pad.load()) {
         i = stream_states().erase(i);
       } else {
         ++i;
@@ -155,6 +165,33 @@ GroupStreamGuard::~GroupStreamGuard() {
     // against this one.
     frontier_->last_stream.reset();
   }
+}
+
+std::shared_ptr<const SignalPad> get_or_create_signal_pad(
+    const c10::intrusive_ptr<c10d::ProcessGroup>& pg,
+    c10::DeviceIndex device,
+    const std::function<std::shared_ptr<const SignalPad>()>& create) {
+  TORCH_CHECK(pg != nullptr, "get_or_create_signal_pad: null ProcessGroup");
+  auto state = get_group_stream_state(pg, device);
+  std::lock_guard<std::mutex> lock(state->pad_mu);
+  if (state->pad == nullptr) {
+    // Creation allocates and synchronizes the device, which a capture would
+    // record into the graph instead of running.
+    TORCH_CHECK(
+        c10::cuda::currentStreamCaptureStatusMayInitCtx() ==
+            c10::cuda::CaptureStatus::None,
+        "symm_mem: group '",
+        pg->getGroupName(),
+        "' has no signal pad on device ",
+        static_cast<int>(device),
+        " yet, and creating one cannot be captured. Rendezvous a tensor on "
+        "the group once before capturing.");
+    // Published only once fully built, so no rank sees a partial pad.
+    state->pad = create();
+    TORCH_INTERNAL_ASSERT(state->pad != nullptr);
+    state->has_pad.store(true);
+  }
+  return state->pad;
 }
 
 } // namespace c10d::symmetric_memory

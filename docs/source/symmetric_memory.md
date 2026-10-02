@@ -115,9 +115,11 @@ correct synchronizations to make sure that peers are ready for communication,
 and signal to them that this GPU is ready.
 
 PyTorch Symmetric Memory provides CUDA Graph-compatible synchronization
-primitives that operate on the signal pad accompanying each symmetric memory
-allocation. Kernels using symmetric memory can be written both in CUDA and in
-Triton. Here’s an example allocating symmetric tensor and exchanging handles:
+primitives that operate on signal pads. On the CUDA and NCCL backends a signal
+pad belongs to a process group on a device, as a communicator does: every
+symmetric memory handle of the group on that device shares it. (The NVSHMEM
+backend keeps one per allocation.) Kernels using symmetric memory can be
+written both in CUDA and in Triton. Here’s an example allocating symmetric tensor and exchanging handles:
 
 ```python
 import torch.distributed._symmetric_memory as symm_mem
@@ -680,13 +682,11 @@ them directly via `torch.ops.symm_mem.<op_name>`.
     requires hardware support for multimem operations. On NVIDIA GPUs, NVLink
     SHARP is required.
 
-    .. warning::
-        All symm_mem collectives for a given group must be issued from a single
-        CUDA stream. The kernels synchronize ranks using a shared signal pad
-        indexed by block ID with no per-stream isolation; issuing concurrent
-        launches from different streams on the same group will cause a deadlock.
-        To use symm_mem collectives from multiple streams, serialize them onto
-        one dedicated stream using ``stream.wait_stream()`` / ``current_stream.wait_stream()``.
+    .. note::
+        The kernels synchronize ranks through the group's signal pad, indexed
+        by block ID. On the CUDA and NCCL backends, symm_mem operations of one
+        group are ordered across CUDA streams in issue order, as other
+        collectives are, so every rank must issue them in the same order.
 
     :param Tensor input: Input tensor to perform all-reduce on. Must be symmetric.
     :param str reduce_op: Reduction operation to perform. Currently only "sum" is supported.

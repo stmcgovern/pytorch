@@ -4,6 +4,7 @@
 #include <c10/macros/Export.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -68,5 +69,19 @@ class TORCH_API GroupStreamGuard {
   // stream it launched on. The event is recorded there on destruction.
   Frontier* frontier_ = nullptr;
 };
+
+class SignalPad;
+
+// The signal pad of (pg, device), built by `create` on the first call. The
+// state it lives in is the one GroupStreamGuard orders the group's ops by, so
+// the pad and its ordering share one key. `create` is collective: callers must
+// reach the first call for a (pg, device) at the same point on every rank,
+// which the first rendezvous of the group on the device is. A pad is never
+// freed: freeing it needs every peer to have stopped using it, and nothing
+// marks that point.
+TORCH_API std::shared_ptr<const SignalPad> get_or_create_signal_pad(
+    const c10::intrusive_ptr<c10d::ProcessGroup>& pg,
+    c10::DeviceIndex device,
+    const std::function<std::shared_ptr<const SignalPad>()>& create);
 
 } // namespace c10d::symmetric_memory

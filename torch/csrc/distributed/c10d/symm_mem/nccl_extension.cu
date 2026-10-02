@@ -104,7 +104,8 @@ __global__ void lsa_put_kernel(
 
 __global__ void lsa_put_signal_kernel(
     void**  buffer,  // buffers_dev_
-    void**  signal_pad,  // signal pointer table (uint64_t-based)
+    void**  signal_pad,  // signal pointer table
+    size_t  signal_byte_offset,  // the pad's u64 signal word
     int  dst_peer,
     size_t  dst_byte_offset,  // data target offset (bytes)
     const void*  src,  // local src
@@ -131,8 +132,8 @@ __global__ void lsa_put_signal_kernel(
 
         // If this was the last block to finish:
         if (prev == gridDim.x - 1) {
-            uint64_t* signal_pad_peer =
-            reinterpret_cast<uint64_t*>(signal_pad[dst_peer]);
+            uint64_t* signal_pad_peer = reinterpret_cast<uint64_t*>(
+                static_cast<char*>(signal_pad[dst_peer]) + signal_byte_offset);
 
             // Single-writer: atomicExch is conservative but safe.
             atomicExch(
@@ -144,12 +145,14 @@ __global__ void lsa_put_signal_kernel(
 
 __global__ void nccl_wait_for_signal_kernel(
     void**  signal_pad,
+    size_t  signal_byte_offset,  // the pad's u64 signal word
     int  cur_rank,
     uint64_t  target_signal_value
 ) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         volatile unsigned long long* sig_ptr =
-            reinterpret_cast<volatile unsigned long long*>(signal_pad[cur_rank]);
+            reinterpret_cast<volatile unsigned long long*>(
+                static_cast<char*>(signal_pad[cur_rank]) + signal_byte_offset);
 
         while (true) {
             unsigned long long val = *sig_ptr;
@@ -199,6 +202,7 @@ void nccl_wait_for_signal(at::Tensor& sigpad, int64_t signal) {
   int cur_rank = symm_mem->get_rank();
   nccl_wait_for_signal_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(
     symm_mem->get_signal_pad_ptrs_dev(),
+    signal_pad_u64_word_offset(symm_mem->get_signal_pad_size()),
     cur_rank,
     signal);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -234,6 +238,7 @@ void nccl_put_with_signal(at::Tensor& tensor, int64_t signal, int64_t peer) {
   lsa_put_signal_kernel<<<blocks, threads, 0, stream>>>(
     symm_mem->get_buffer_ptrs_dev(),
     symm_mem->get_signal_pad_ptrs_dev(),
+    signal_pad_u64_word_offset(symm_mem->get_signal_pad_size()),
     peer,
     0,
     tensor.data_ptr(),

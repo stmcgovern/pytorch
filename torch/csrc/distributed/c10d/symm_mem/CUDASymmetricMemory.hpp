@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAAllocatorConfig.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryTypes.hpp>
+#include <torch/csrc/distributed/c10d/symm_mem/SignalPad.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
 #include <shared_mutex>
@@ -48,6 +49,7 @@ class CUDASymmetricMemory : public SymmetricMemory {
   void** get_buffer_ptrs_dev() override;
   void** get_signal_pad_ptrs_dev() override;
   size_t get_buffer_size() override;
+  size_t get_signal_pad_size() override;
   size_t get_offset() override;
 
   bool has_multicast_support() override;
@@ -104,8 +106,12 @@ class CUDAPeerAllocInfo : public c10::intrusive_ptr_target {
   void** buffers_dev_;
   void** signal_pads_dev_;
   std::string group_name_;
+  // The group's pad, set by rendezvous() before the info is shared with any
+  // handle. Unset only on the info that maps a pad itself.
+  std::shared_ptr<const SignalPad> pad_;
 
   friend class CUDASymmetricMemory;
+  friend class CUDASymmetricMemoryAllocator;
 };
 
 // Metadata associated with each allocation performed by
@@ -148,6 +154,17 @@ class CUDASymmetricMemoryAllocator : public SymmetricMemoryAllocator {
   std::string name() override;
 
  private:
+  // Allocates and maps a block without registering it, so that alloc() and
+  // the group signal pads share one allocation path.
+  c10::intrusive_ptr<Block> create_block(
+      size_t size,
+      int device_idx,
+      const std::optional<std::string>& group_name);
+  // The signal pad of (group, device), created by the group's first
+  // rendezvous on the device.
+  std::shared_ptr<const SignalPad> signal_pad(
+      const std::string& group_name,
+      int device_idx);
   c10::intrusive_ptr<Block> find_block(void* ptr);
   c10::intrusive_ptr<Block> find_block_covering(void* ptr, size_t& offset);
 

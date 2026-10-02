@@ -1,4 +1,5 @@
 #pragma once
+#include <torch/csrc/distributed/c10d/symm_mem/SignalPad.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 
@@ -41,6 +42,8 @@ class TORCH_API NCCLSymmetricMemory : public SymmetricMemory {
   void** get_signal_pad_ptrs_dev() override;
 
   size_t get_buffer_size() override;
+
+  size_t get_signal_pad_size() override;
 
   std::string get_group_name();
 

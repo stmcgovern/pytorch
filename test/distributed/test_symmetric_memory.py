@@ -299,9 +299,12 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         custom_size = original_size * 2
         symm_mem.set_signal_pad_size(custom_size)
 
-        # Allocate symmetric memory and verify the signal pad size
+        # Allocate symmetric memory and verify the signal pad size. The pad
+        # belongs to the group and keeps the size it was created with, so use a
+        # group whose pad does not exist yet.
+        group = dist.new_group(list(range(self.world_size)))
         t = symm_mem.empty(64, device="cuda")
-        symm_mem_hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
+        symm_mem_hdl = symm_mem.rendezvous(t, group=group)
 
         # Verify the allocated symmetric memory uses the custom signal pad size
         self.assertEqual(symm_mem_hdl.signal_pad_size, custom_size)
@@ -543,7 +546,11 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     def test_allow_overlapping_devices(self) -> None:
         os.environ["TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES"] = "1"
         t = symm_mem.empty(64, device="cuda:0")
-        symm_mem_hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
+        # Every rank moves to cuda:0 here, but earlier tests gave WORLD a signal
+        # pad on rank 0's device only. A fresh group's first rendezvous on
+        # cuda:0 is one every rank reaches.
+        group = dist.new_group(list(range(self.world_size)))
+        symm_mem_hdl = symm_mem.rendezvous(t, group=group)
 
         self.assertEqual(symm_mem_hdl.rank, self.rank)
         self.assertEqual(symm_mem_hdl.world_size, self.world_size)
@@ -1716,6 +1723,113 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         )
         self.assertFalse(while_gated, "b finished while a was gated")
         self.assertTrue(after_open, "b waits for work queued on the stream after a")
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(3)
+    def test_signal_pad_not_shared_across_groups(self) -> None:
+        """A signal sent in one group must not land in another group's pad.
+
+        A slot is chosen by (channel, src_rank), both group-local, so two groups
+        rendezvousing one allocation used to address the same word (#192581).
+        The subgroup leaves rank 1 out: its rank 1 is global rank 2, whose
+        signal took the slot WORLD keeps for global rank 1.
+        """
+        self._init_process()
+        subgroup = dist.new_group([0, 2])
+        t = symm_mem.empty(64, device=self.device)
+        hdl_world = symm_mem.rendezvous(t, group=dist.group.WORLD)
+        hdl_sub = (
+            symm_mem.rendezvous(t, group=subgroup) if self.rank in (0, 2) else None
+        )
+        dist.barrier()
+
+        if self.rank == 2:
+            hdl_sub.put_signal(dst_rank=0)
+            torch.cuda.synchronize()
+        dist.barrier()
+
+        if self.rank == 0:
+            sub_pad = hdl_sub.get_signal_pad(0, (8,))
+            world_pad = hdl_world.get_signal_pad(0, (8,))
+            self.assertNotEqual(sub_pad[1].item(), 0)
+            self.assertEqual(world_pad[1].item(), 0)
+            # Consume it: the pad is the group's and outlives this test.
+            hdl_sub.wait_signal(src_rank=1)
+            torch.cuda.synchronize()
+        dist.barrier()
+
+        hdl_world.barrier()
+        if hdl_sub is not None:
+            hdl_sub.barrier()
+        torch.cuda.synchronize()
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_signal_pad_shared_within_group(self) -> None:
+        """Every handle of a group uses the group's pad, whatever allocation it
+        came from, and the group's barriers stay apart across streams."""
+        self._init_process()
+        t1 = symm_mem.empty(64, device=self.device)
+        t2 = symm_mem.empty(64, device=self.device)
+        hdl1 = symm_mem.rendezvous(t1, group=dist.group.WORLD)
+        hdl2 = symm_mem.rendezvous(t2, group=dist.group.WORLD)
+        self.assertEqual(hdl1.signal_pad_ptrs, hdl2.signal_pad_ptrs)
+
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        for _ in range(100):
+            for hdl, stream in zip((hdl1, hdl2), streams, strict=True):
+                with torch.cuda.stream(stream):
+                    hdl.barrier(channel=0)
+        torch.cuda.synchronize()
+        pad = hdl1.get_signal_pad(self.rank)
+        self.assertEqual(pad, torch.zeros_like(pad))
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_signal_pad_size_disagreement_raises_everywhere(self) -> None:
+        """Creating a group's pad checks that every rank asked for the same size.
+        Every rank raises, none waits on another, and a later rendezvous with
+        agreeing sizes creates the pad."""
+        self._init_process()
+        original_size = symm_mem.get_signal_pad_size()
+        group = dist.new_group(list(range(self.world_size)))
+        t = symm_mem.empty(64, device=self.device)
+        try:
+            symm_mem.set_signal_pad_size(original_size + 4096 * self.rank)
+            with self.assertRaises(RuntimeError):
+                symm_mem.rendezvous(t, group=group)
+        finally:
+            symm_mem.set_signal_pad_size(original_size)
+        hdl = symm_mem.rendezvous(t, group=group)
+        self.assertEqual(hdl.get_signal_pad(self.rank).numel() * 4, original_size)
+        hdl.barrier()
+        torch.cuda.synchronize()
+
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_signal_pad_creation_not_captured(self) -> None:
+        """A group's first rendezvous on a device creates its pad, which a graph
+        capture cannot record; it raises rather than capture half of it."""
+        self._init_process()
+        group = dist.new_group(list(range(self.world_size)))
+        t = symm_mem.empty(64, device=self.device)
+        graph = torch.cuda.CUDAGraph()
+        # Capturing a rendezvous fails anyway (it synchronizes); this is the
+        # error that names the cause.
+        with self.assertRaisesRegex(RuntimeError, "has no signal pad on device"):
+            with torch.cuda.graph(graph):
+                symm_mem.rendezvous(t, group=group)
+        hdl = symm_mem.rendezvous(t, group=group)
+        hdl.barrier()
+        torch.cuda.synchronize()
 
 
 # We move AsyncTP tests to a separate test suite because 1) Async TP ops are not

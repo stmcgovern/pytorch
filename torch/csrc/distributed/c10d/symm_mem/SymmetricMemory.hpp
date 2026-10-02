@@ -41,6 +41,15 @@ inline void check_rank(int rank, int world_size) {
 // provided that the signal pads remain zero-filled following successful
 // synchronization.
 //
+// On the CUDA and NCCL backends a signal pad belongs to a process group on a
+// device, as a communicator does, not to an allocation: every handle of the
+// group on that device, whatever allocation it was rendezvoused from, uses the
+// same pad, and get_signal_pad() returns it. Its size is fixed when the group's
+// first rendezvous on the device creates it, which every rank of the group must
+// reach together, and it lives until the process exits. As for other
+// collectives, the group's operations on one channel must be issued in the same
+// order on every rank. The NVSHMEM backend still keeps a pad per allocation.
+//
 // NOTE [symmetric memory synchronization channel]
 // Synchronization channels allow users to use a single SymmetricMemory object
 // to perform isolated synchronizations on different streams. For example,
@@ -68,7 +77,10 @@ class TORCH_API SymmetricMemory : public torch::CustomClassHolder {
   virtual void** get_buffer_ptrs_dev() = 0;
   virtual void** get_signal_pad_ptrs_dev() = 0;
   virtual size_t get_buffer_size() = 0;
-  size_t get_signal_pad_size();
+  // Bytes of the signal pad this handle synchronizes through. The CUDA and NCCL
+  // backends report their group's pad, fixed when it was created; the default
+  // is the current get_signal_pad_size() setting.
+  virtual size_t get_signal_pad_size();
 
   virtual size_t get_offset() = 0;
 
